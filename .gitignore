@@ -8,5 +8,8 @@ caddy_data/
 # Исходники alexbers (клонируются при деплое)
 src/
 
+# Локальный контекст для Claude Code агента
+CLAUDE.md
+
 # Артефакты Docker
 *.log
