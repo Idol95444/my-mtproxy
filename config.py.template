@@ -1,0 +1,10 @@
+PORT = 853
+
+USERS = {
+    "user1": "__BASE_SECRET__",
+}
+
+TLS_DOMAIN = "__DOMAIN__"
+
+# Uncomment after registering proxy in @MTProxybot (/newproxy)
+# AD_TAG = "__AD_TAG__"

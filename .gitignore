@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+config.py
+.env
+
+# Caddy TLS private keys
+caddy_data/
+
+# alexbers source (cloned at deploy time)
+src/
+
+# Docker artifacts
+*.log
