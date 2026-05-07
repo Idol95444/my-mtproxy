@@ -1,12 +1,12 @@
-# Secrets — NEVER commit
+# Секреты — НИКОГДА не коммитить
 config.py
 .env
 
-# Caddy TLS private keys
+# Приватные ключи TLS-сертификата Caddy
 caddy_data/
 
-# alexbers source (cloned at deploy time)
+# Исходники alexbers (клонируются при деплое)
 src/
 
-# Docker artifacts
+# Артефакты Docker
 *.log

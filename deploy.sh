@@ -2,24 +2,24 @@
 set -euo pipefail
 
 # ============================================================
-# deploy.sh — one-command MTProto proxy setup
-# Usage: git clone <repo> && cd my-mtproxy && bash deploy.sh
+# deploy.sh — установка MTProto-прокси одной командой
+# Использование: git clone <repo> && cd my-mtproxy && bash deploy.sh
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ---------- colors ----------
+# ---------- цвета ----------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+info()  { echo -e "${GREEN}[ИНФО]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[ВНИМАНИЕ]${NC}  $*"; }
+error() { echo -e "${RED}[ОШИБКА]${NC} $*"; exit 1; }
 
-# ---------- detect docker compose command ----------
+# ---------- определение команды docker compose ----------
 detect_compose() {
     if docker compose version &>/dev/null; then
         COMPOSE="docker compose"
@@ -28,84 +28,84 @@ detect_compose() {
     else
         return 1
     fi
-    info "Using: $COMPOSE"
+    info "Используем: $COMPOSE"
 }
 
-# ---------- load or ask for variables ----------
+# ---------- загрузка или запрос переменных ----------
 load_config() {
     if [[ -f .env ]]; then
-        info "Found .env, loading values..."
+        info "Найден .env, загружаю значения..."
         # shellcheck source=/dev/null
         source .env
     fi
 
     if [[ -z "${DOMAIN:-}" ]]; then
         echo ""
-        read -rp "Domain (e.g. tg.example.com): " DOMAIN
+        read -rp "Домен (например tg.example.com): " DOMAIN
     fi
-    [[ -z "$DOMAIN" ]] && error "DOMAIN cannot be empty"
+    [[ -z "$DOMAIN" ]] && error "DOMAIN не может быть пустым"
 
     if [[ -z "${BASE_SECRET:-}" ]]; then
         echo ""
-        info "Generate a secret with:  head -c 16 /dev/urandom | xxd -ps"
-        read -rp "Base secret (32 hex chars): " BASE_SECRET
+        info "Сгенерируй секрет командой:  head -c 16 /dev/urandom | xxd -ps"
+        read -rp "Базовый секрет (32 hex-символа): " BASE_SECRET
     fi
-    [[ ${#BASE_SECRET} -ne 32 ]] && error "BASE_SECRET must be exactly 32 hex characters"
+    [[ ${#BASE_SECRET} -ne 32 ]] && error "BASE_SECRET должен быть ровно 32 hex-символа"
     if ! [[ "$BASE_SECRET" =~ ^[0-9a-fA-F]{32}$ ]]; then
-        error "BASE_SECRET must contain only hex characters (0-9, a-f)"
+        error "BASE_SECRET должен содержать только hex-символы (0-9, a-f)"
     fi
 
     if [[ -z "${AD_TAG:-}" ]]; then
         echo ""
-        info "AD_TAG is optional. Get it from @MTProxybot -> /newproxy"
-        read -rp "AD_TAG (leave empty to skip): " AD_TAG
+        info "AD_TAG — необязательный. Получи его в @MTProxybot -> /newproxy"
+        read -rp "AD_TAG (оставь пустым чтобы пропустить): " AD_TAG
     fi
 
-    # Save for next run
+    # Сохраняем для следующего запуска
     cat > .env <<EOF
 DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
 AD_TAG=${AD_TAG:-}
 EOF
     chmod 600 .env
-    info "Saved values to .env (chmod 600)"
+    info "Значения сохранены в .env (chmod 600)"
 }
 
-# ---------- install docker if missing ----------
+# ---------- установка Docker если отсутствует ----------
 install_docker() {
     if command -v docker &>/dev/null; then
-        info "Docker already installed"
+        info "Docker уже установлен"
     else
-        info "Installing Docker..."
+        info "Устанавливаю Docker..."
         apt update && apt install -y docker.io git curl
         systemctl enable --now docker
     fi
 
     if ! detect_compose; then
-        info "Installing docker-compose-v2..."
+        info "Устанавливаю docker-compose-v2..."
         apt install -y docker-compose-v2 || apt install -y docker-compose
-        detect_compose || error "Cannot find docker compose after install"
+        detect_compose || error "Не удалось найти docker compose после установки"
     fi
 }
 
-# ---------- clone alexbers ----------
+# ---------- клонирование alexbers ----------
 clone_alexbers() {
     if [[ -d src/.git ]]; then
-        info "src/ already exists, pulling latest..."
+        info "src/ уже существует, обновляю..."
         git -C src pull
     else
-        info "Cloning alexbers/mtprotoproxy (stable)..."
+        info "Клонирую alexbers/mtprotoproxy (ветка stable)..."
         rm -rf src
         git clone -b stable https://github.com/alexbers/mtprotoproxy.git src
     fi
 }
 
-# ---------- generate configs from templates ----------
+# ---------- генерация конфигов из шаблонов ----------
 generate_configs() {
-    info "Generating Caddyfile from template..."
+    info "Генерирую Caddyfile из шаблона..."
     sed "s/__DOMAIN__/$DOMAIN/g" Caddyfile.template > Caddyfile
 
-    info "Generating config.py from template..."
+    info "Генерирую config.py из шаблона..."
     local secret_escaped="${BASE_SECRET//\//\\/}"
     if [[ -n "${AD_TAG:-}" ]]; then
         sed \
@@ -120,55 +120,55 @@ generate_configs() {
             config.py.template > config.py
     fi
     chmod 600 config.py
-    info "config.py generated (chmod 600)"
+    info "config.py сгенерирован (chmod 600)"
 }
 
-# ---------- pre-flight: check DNS ----------
+# ---------- проверка DNS ----------
 check_dns() {
-    info "Checking DNS for $DOMAIN..."
+    info "Проверяю DNS для $DOMAIN..."
     local resolved
     resolved=$(dig +short "$DOMAIN" 2>/dev/null | head -1)
     if [[ -z "$resolved" ]]; then
-        warn "DNS lookup returned nothing for $DOMAIN"
-        warn "Make sure A-record points to this server's IP"
-        read -rp "Continue anyway? [y/N]: " yn
+        warn "DNS-запрос не вернул результатов для $DOMAIN"
+        warn "Убедись что A-запись указывает на IP этого сервера"
+        read -rp "Продолжить всё равно? [y/N]: " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
     else
-        info "DNS resolves to: $resolved"
+        info "DNS резолвится в: $resolved"
     fi
 }
 
-# ---------- start services ----------
+# ---------- запуск сервисов ----------
 start_services() {
-    info "Starting Caddy first (to get LE certificate)..."
+    info "Запускаю Caddy первым (для получения LE-сертификата)..."
     $COMPOSE up -d caddy
-    info "Waiting 20 seconds for LE certificate..."
+    info "Жду 20 секунд пока Caddy получит сертификат..."
     sleep 20
 
-    # Check certificate
-    info "Verifying TLS certificate..."
+    # Проверка сертификата
+    info "Проверяю TLS-сертификат..."
     local cert_info
     cert_info=$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" 2>/dev/null \
         | openssl x509 -noout -subject -issuer 2>/dev/null) || true
 
     if echo "$cert_info" | grep -qi "let.s.encrypt\|zerossl\|$DOMAIN"; then
-        info "Certificate OK:"
+        info "Сертификат OK:"
         echo "$cert_info"
     else
-        warn "Could not verify LE certificate. Caddy logs:"
+        warn "Не удалось проверить LE-сертификат. Логи Caddy:"
         $COMPOSE logs --tail 20 caddy
-        warn "Certificate may still be provisioning. Continuing..."
+        warn "Сертификат может ещё выпускаться. Продолжаю..."
     fi
 
-    info "Starting alexbers..."
+    info "Запускаю alexbers..."
     $COMPOSE up -d --build alexbers
     sleep 5
 
-    info "alexbers logs:"
+    info "Логи alexbers:"
     $COMPOSE logs --tail 15 alexbers
 }
 
-# ---------- print result ----------
+# ---------- вывод результата ----------
 print_result() {
     local hex_domain
     hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
@@ -177,46 +177,46 @@ print_result() {
 
     echo ""
     echo "============================================================"
-    echo -e "${GREEN} MTProto Proxy is running!${NC}"
+    echo -e "${GREEN} MTProto-прокси запущен!${NC}"
     echo "============================================================"
     echo ""
-    echo "FakeTLS link for users:"
+    echo "FakeTLS-ссылка для пользователей:"
     echo ""
     echo -e "  ${YELLOW}${link}${NC}"
     echo ""
     echo "------------------------------------------------------------"
-    echo "Remaining manual steps:"
+    echo "Оставшиеся ручные шаги:"
     echo ""
-    echo "  1. Open @MTProxybot in Telegram"
-    echo "  2. Send /newproxy"
-    echo "  3. Enter: ${DOMAIN}:853"
-    echo "  4. Enter base secret: ${BASE_SECRET}"
-    echo "  5. Save the AD_TAG from bot response"
-    echo "  6. IMPORTANT: /myproxies -> select your proxy"
-    echo "     -> Set promoted channel -> @your_channel"
-    echo "     (Without this, the sponsored channel will NOT appear!)"
-    echo "  7. Add AD_TAG to .env and re-run deploy.sh"
-    echo "     or edit config.py manually and restart:"
+    echo "  1. Открой @MTProxybot в Telegram"
+    echo "  2. Отправь /newproxy"
+    echo "  3. Введи: ${DOMAIN}:853"
+    echo "  4. Введи базовый секрет: ${BASE_SECRET}"
+    echo "  5. Сохрани AD_TAG из ответа бота"
+    echo "  6. ВАЖНО: /myproxies -> выбери свой прокси"
+    echo "     -> Set promoted channel -> @твой_канал"
+    echo "     (Без этого спонсорский канал НЕ появится!)"
+    echo "  7. Добавь AD_TAG в .env и перезапусти deploy.sh"
+    echo "     или отредактируй config.py вручную и перезапусти:"
     echo "     $COMPOSE restart alexbers"
     echo ""
-    echo "Management:"
-    echo "  $COMPOSE logs --tail 50 alexbers    # proxy logs"
-    echo "  $COMPOSE logs --tail 30 caddy       # caddy logs"
-    echo "  $COMPOSE restart alexbers            # restart proxy"
-    echo "  $COMPOSE down && $COMPOSE up -d      # full restart"
+    echo "Управление:"
+    echo "  $COMPOSE logs --tail 50 alexbers    # логи прокси"
+    echo "  $COMPOSE logs --tail 30 caddy       # логи Caddy"
+    echo "  $COMPOSE restart alexbers            # перезапуск прокси"
+    echo "  $COMPOSE down && $COMPOSE up -d      # полный перезапуск"
     echo "============================================================"
 }
 
-# ===================== MAIN =====================
+# ===================== ГЛАВНЫЙ БЛОК =====================
 
 echo ""
 echo "=========================================="
-echo "  MTProto Proxy Deployer"
+echo "  Установщик MTProto-прокси"
 echo "=========================================="
 echo ""
 
-# Must run as root (Docker needs it)
-[[ $EUID -eq 0 ]] || error "Run as root: sudo bash deploy.sh"
+# Нужен root (для Docker)
+[[ $EUID -eq 0 ]] || error "Запусти от root: sudo bash deploy.sh"
 
 load_config
 install_docker
