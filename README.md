@@ -6,7 +6,7 @@
 
 ```bash
 # На свежем VPS (Ubuntu 22.04+ / Debian 12, под root):
-git clone git@github.com:YOUR_USERNAME/my-mtproxy.git
+git clone git@github.com:Idol95444/my-mtproxy.git
 cd my-mtproxy
 bash deploy.sh
 ```
