@@ -2,32 +2,50 @@
 set -euo pipefail
 
 # ============================================================
-# manage.sh — установщик и менеджер MTProto-прокси с TUI (whiptail)
+# manage.sh — установщик и менеджер MTProto-прокси
 # Использование: sudo bash manage.sh
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# ============ COLORS ============
+
+if [[ -t 1 ]]; then
+    C_RED=$'\033[31m'
+    C_GRN=$'\033[32m'
+    C_YLW=$'\033[33m'
+    C_BLU=$'\033[34m'
+    C_CYN=$'\033[36m'
+    C_DIM=$'\033[2m'
+    C_BLD=$'\033[1m'
+    C_RST=$'\033[0m'
+else
+    C_RED="" C_GRN="" C_YLW="" C_BLU="" C_CYN="" C_DIM="" C_BLD="" C_RST=""
+fi
+
+# ============ GLOBALS ============
 
 COMPOSE=""
 SSH_PORT="22"
-BT="MTProto Proxy Manager"
 
 # ============ HELPERS ============
 
-ensure_root() {
-    [[ $EUID -eq 0 ]] || { echo "Запусти от root: sudo bash manage.sh"; exit 1; }
+require_root() {
+    [[ $EUID -eq 0 ]] || {
+        printf '%sЗапусти от root: sudo bash manage.sh%s\n' "$C_RED" "$C_RST"
+        exit 1
+    }
 }
 
 ensure_deps() {
     local need=()
-    command -v whiptail >/dev/null 2>&1 || need+=(whiptail)
     command -v ss >/dev/null 2>&1 || need+=(iproute2)
     command -v xxd >/dev/null 2>&1 || need+=(xxd)
     command -v dig >/dev/null 2>&1 || need+=(dnsutils)
-    command -v less >/dev/null 2>&1 || need+=(less)
+    command -v git >/dev/null 2>&1 || need+=(git)
     if [[ ${#need[@]} -gt 0 ]]; then
-        echo "Устанавливаю зависимости: ${need[*]}"
+        printf '%sУстанавливаю зависимости: %s%s\n' "$C_DIM" "${need[*]}" "$C_RST"
         apt update >/dev/null 2>&1
         apt install -y "${need[@]}" >/dev/null 2>&1
     fi
@@ -49,69 +67,189 @@ detect_ssh_port() {
     SSH_PORT="${port:-22}"
 }
 
-# ============ WHIPTAIL WRAPPERS ============
-
-w_msg() {
-    whiptail --backtitle "$BT" --title "$1" --msgbox "$2" "${3:-12}" "${4:-70}"
+pause() {
+    printf '\n%s[Enter — назад в меню]%s ' "$C_DIM" "$C_RST"
+    read -r _ </dev/tty || true
 }
 
-w_yesno() {
-    whiptail --backtitle "$BT" --title "$1" --yesno "$2" "${3:-10}" "${4:-70}"
+confirm() {
+    local prompt="${1:-Продолжить?}"
+    local default="${2:-N}"
+    local hint="[y/N]"
+    [[ "$default" == "Y" ]] && hint="[Y/n]"
+    printf '%s %s: ' "$prompt" "$hint"
+    local ans
+    read -r ans </dev/tty
+    if [[ "$default" == "Y" ]]; then
+        [[ "$ans" != "n" && "$ans" != "N" ]]
+    else
+        [[ "$ans" == "y" || "$ans" == "Y" ]]
+    fi
 }
 
-w_input() {
-    whiptail --backtitle "$BT" --title "$1" --inputbox "$2" 10 70 "${3:-}" 3>&1 1>&2 2>&3
+prompt_value() {
+    local label="$1" default="${2:-}" input
+    if [[ -n "$default" ]]; then
+        printf '       %s [%s]: ' "$label" "$default" >&2
+    else
+        printf '       %s: ' "$label" >&2
+    fi
+    read -r input </dev/tty
+    printf '%s' "${input:-$default}"
 }
 
-w_menu() {
-    local title="$1" prompt="$2"
-    shift 2
-    whiptail --backtitle "$BT" --title "$title" --menu "$prompt" 20 70 10 "$@" 3>&1 1>&2 2>&3
+ok_inline() {
+    printf '%s✓ %s%s\n' "$C_GRN" "$1" "$C_RST"
 }
 
-w_scroll() {
-    # Показать файл с прокруткой через less
+fail_inline() {
+    printf '%s✗ %s%s\n' "$C_RED" "$1" "$C_RST"
+}
+
+step() {
+    printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"
+}
+
+# ============ SCREEN ============
+
+print_header() {
     clear
-    echo "=== $1 ==="
-    echo "(нажми q для выхода)"
-    echo ""
-    sleep 1
-    less -R "$2"
+    cat <<HEADER
+${C_CYN}${C_BLD}╔══════════════════════════════════════════════════════════╗
+║          MTProto Proxy Manager — control panel           ║
+╚══════════════════════════════════════════════════════════╝${C_RST}
+HEADER
 }
 
-# ============ DEPLOY MODULE ============
+print_status() {
+    detect_compose
 
-mod_deploy() {
-    local DOMAIN BASE_SECRET AD_TAG existing_domain="" existing_secret="" existing_tag=""
+    local domain="${C_DIM}не установлен${C_RST}"
+    local proxy_state="${C_DIM}не запущен${C_RST}"
+    local caddy_state="${C_DIM}не запущен${C_RST}"
+    local ad_tag_state="${C_DIM}нет${C_RST}"
+    local ufw_state="${C_DIM}не настроен${C_RST}"
 
     if [[ -f .env ]]; then
+        local DOMAIN="" AD_TAG=""
         # shellcheck source=/dev/null
-        source .env
-        existing_domain="${DOMAIN:-}"
-        existing_secret="${BASE_SECRET:-}"
-        existing_tag="${AD_TAG:-}"
+        source .env 2>/dev/null || true
+        [[ -n "${DOMAIN:-}" ]] && domain="$DOMAIN"
+        [[ -n "${AD_TAG:-}" ]] && ad_tag_state="${C_GRN}настроен${C_RST}"
     fi
 
-    DOMAIN=$(w_input "Установка прокси (1/3)" "Введи домен (с A-записью на этот VPS):" "$existing_domain") || return
-    [[ -z "$DOMAIN" ]] && { w_msg "Ошибка" "DOMAIN не может быть пустым"; return; }
+    if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
+        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
+            proxy_state="${C_GRN}запущен${C_RST}"
+        else
+            proxy_state="${C_YLW}остановлен${C_RST}"
+        fi
+        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-caddy"; then
+            caddy_state="${C_GRN}запущен${C_RST}"
+        else
+            caddy_state="${C_YLW}остановлен${C_RST}"
+        fi
+    fi
 
-    BASE_SECRET=$(w_input "Установка прокси (2/3)" "Базовый секрет (32 hex-символа).\nОставь пустым — сгенерирую автоматически." "$existing_secret") || return
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw_state="${C_GRN}активен${C_RST}"
+        else
+            ufw_state="${C_YLW}неактивен${C_RST}"
+        fi
+    fi
 
+    cat <<STATUS
+
+  ${C_BLD}Домен:${C_RST}      ${domain}
+  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 853)${C_RST}
+  ${C_BLD}Caddy:${C_RST}      ${caddy_state}    ${C_DIM}(порт 80, 443)${C_RST}
+  ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
+  ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
+
+STATUS
+}
+
+print_menu() {
+    cat <<MENU
+${C_BLD}═══ УСТАНОВКА ═══${C_RST}
+  ${C_CYN}1)${C_RST} Установить прокси            ${C_DIM}(домен, секрет, AD_TAG)${C_RST}
+  ${C_CYN}2)${C_RST} Настроить безопасность VPS   ${C_DIM}(ufw, fail2ban, sysctl)${C_RST}
+
+${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
+  ${C_CYN}3)${C_RST} Статус контейнеров
+  ${C_CYN}4)${C_RST} Логи alexbers                ${C_DIM}(live, Ctrl+C — выход)${C_RST}
+  ${C_CYN}5)${C_RST} Логи Caddy                   ${C_DIM}(live, Ctrl+C — выход)${C_RST}
+  ${C_CYN}6)${C_RST} Перезапустить прокси
+  ${C_CYN}7)${C_RST} Остановить всё
+  ${C_CYN}8)${C_RST} Запустить всё
+  ${C_CYN}9)${C_RST} Показать ссылку для пользователей
+
+${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
+  ${C_CYN}10)${C_RST} Обновить скрипт из git
+  ${C_CYN}11)${C_RST} Удалить прокси
+
+  ${C_DIM}0) Выход${C_RST}
+
+MENU
+}
+
+# ============ ACTIONS: DEPLOY ============
+
+action_deploy() {
+    print_header
+    printf '%s═══ Установка прокси ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    local DOMAIN="" BASE_SECRET="" AD_TAG=""
+    if [[ -f .env ]]; then
+        # shellcheck source=/dev/null
+        source .env 2>/dev/null || true
+    fi
+
+    step "1/3" "Домен (с A-записью на этот VPS)"
+    DOMAIN=$(prompt_value "Введи домен" "$DOMAIN")
+    if [[ -z "$DOMAIN" ]]; then
+        fail_inline "DOMAIN не может быть пустым"
+        pause; return
+    fi
+    printf '\n'
+
+    step "2/3" "Базовый секрет (32 hex-символа, пусто — сгенерирую)"
+    BASE_SECRET=$(prompt_value "Секрет" "$BASE_SECRET")
     if [[ -z "$BASE_SECRET" ]]; then
         BASE_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
-        w_msg "Сгенерирован секрет" "Базовый секрет:\n\n${BASE_SECRET}\n\nСохрани — пригодится для @MTProxybot." 12
+        ok_inline "Сгенерирован: ${BASE_SECRET}"
     elif ! [[ "$BASE_SECRET" =~ ^[0-9a-fA-F]{32}$ ]]; then
-        w_msg "Ошибка" "BASE_SECRET должен быть ровно 32 hex-символа (0-9, a-f)"
-        return
+        fail_inline "BASE_SECRET должен быть 32 hex-символа (0-9, a-f)"
+        pause; return
     fi
+    printf '\n'
 
-    AD_TAG=$(w_input "Установка прокси (3/3)" "AD_TAG (необязательно).\nПолучи его в @MTProxybot через /newproxy.\nМожно пропустить и добавить позже." "$existing_tag") || return
+    step "3/3" "AD_TAG (необязательно, можно вписать позже)"
+    printf '       Получи в @MTProxybot через /newproxy\n'
+    AD_TAG=$(prompt_value "AD_TAG" "$AD_TAG")
+    printf '\n'
 
     # DNS-проверка
+    printf '%sПроверяю DNS...%s ' "$C_DIM" "$C_RST"
     local resolved
     resolved=$(dig +short "$DOMAIN" 2>/dev/null | head -1)
     if [[ -z "$resolved" ]]; then
-        w_yesno "DNS" "Домен ${DOMAIN} не резолвится.\n\nA-запись точно настроена?\nПродолжить всё равно?" || return
+        printf '%sне резолвится%s\n' "$C_YLW" "$C_RST"
+        if ! confirm "A-запись точно настроена? Продолжить?" Y; then
+            return
+        fi
+    else
+        printf '%s%s%s\n' "$C_GRN" "$resolved" "$C_RST"
+    fi
+
+    printf '\n%sИтого:%s\n' "$C_BLD" "$C_RST"
+    printf '  Домен:    %s\n' "$DOMAIN"
+    printf '  Секрет:   %s\n' "$BASE_SECRET"
+    printf '  AD_TAG:   %s\n\n' "${AD_TAG:-(пусто)}"
+
+    if ! confirm "Запустить установку?" Y; then
+        return
     fi
 
     # Сохраняем .env
@@ -122,88 +260,112 @@ AD_TAG=${AD_TAG:-}
 EOF
     chmod 600 .env
 
-    # Установка с прогрессом
-    (
-        echo "5"; echo "# Обновляю apt..."
-        apt update >/dev/null 2>&1 || true
+    printf '\n%sУстановка:%s\n' "$C_BLD" "$C_RST"
 
-        echo "15"; echo "# Устанавливаю Docker (если нужно)..."
-        if ! command -v docker &>/dev/null; then
-            apt install -y docker.io git curl >/dev/null 2>&1
-            systemctl enable --now docker >/dev/null 2>&1
-        fi
-        if docker compose version &>/dev/null; then :;
-        elif docker-compose version &>/dev/null; then :;
-        else
-            apt install -y docker-compose-v2 >/dev/null 2>&1 || apt install -y docker-compose >/dev/null 2>&1
-        fi
+    printf '  Обновляю apt... '
+    apt update >/dev/null 2>&1 || true
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "35"; echo "# Клонирую alexbers/mtprotoproxy..."
-        if [[ -d src/.git ]]; then
-            git -C src pull >/dev/null 2>&1
-        else
-            rm -rf src
-            git clone -b stable https://github.com/alexbers/mtprotoproxy.git src >/dev/null 2>&1
-        fi
+    if ! command -v docker &>/dev/null; then
+        printf '  Устанавливаю Docker... '
+        apt install -y docker.io git curl >/dev/null 2>&1
+        systemctl enable --now docker >/dev/null 2>&1
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '  Docker: %sуже установлен%s\n' "$C_DIM" "$C_RST"
+    fi
 
-        echo "50"; echo "# Генерирую конфиги..."
-        sed "s/__DOMAIN__/$DOMAIN/g" Caddyfile.template > Caddyfile
-        if [[ -n "$AD_TAG" ]]; then
-            sed -e "s/__DOMAIN__/$DOMAIN/g" \
-                -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
-                config.py.template > config.py
-        else
-            sed -e "s/__DOMAIN__/$DOMAIN/g" \
-                -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                config.py.template > config.py
-        fi
-        chmod 600 config.py
-
-        echo "65"; echo "# Запускаю Caddy (получение LE-сертификата)..."
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        printf '  Устанавливаю docker-compose... '
+        apt install -y docker-compose-v2 >/dev/null 2>&1 || apt install -y docker-compose >/dev/null 2>&1
         detect_compose
-        $COMPOSE up -d caddy >/dev/null 2>&1
-        sleep 15
+        printf '%sok%s (%s)\n' "$C_GRN" "$C_RST" "$COMPOSE"
+    else
+        printf '  Compose: %s%s%s\n' "$C_DIM" "$COMPOSE" "$C_RST"
+    fi
 
-        echo "85"; echo "# Запускаю alexbers..."
-        $COMPOSE up -d --build alexbers >/dev/null 2>&1
-        sleep 5
+    if [[ -d src/.git ]]; then
+        printf '  Обновляю alexbers/mtprotoproxy... '
+        git -C src pull >/dev/null 2>&1
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '  Клонирую alexbers/mtprotoproxy... '
+        rm -rf src
+        git clone -b stable https://github.com/alexbers/mtprotoproxy.git src >/dev/null 2>&1
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    fi
 
-        echo "100"; echo "# Готово!"
+    printf '  Генерирую конфиги... '
+    sed "s/__DOMAIN__/$DOMAIN/g" Caddyfile.template > Caddyfile
+    if [[ -n "$AD_TAG" ]]; then
+        sed -e "s/__DOMAIN__/$DOMAIN/g" \
+            -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
+            config.py.template > config.py
+    else
+        sed -e "s/__DOMAIN__/$DOMAIN/g" \
+            -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            config.py.template > config.py
+    fi
+    chmod 600 config.py
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    printf '  Запускаю Caddy (получение LE-сертификата)'
+    $COMPOSE up -d caddy >/dev/null 2>&1
+    local i=0
+    while (( i < 20 )); do
         sleep 1
-    ) | whiptail --backtitle "$BT" --title "Установка" --gauge "Запускаю..." 8 70 0
+        i=$((i+1))
+        printf '.'
+    done
+    printf ' %sok%s\n' "$C_GRN" "$C_RST"
 
-    # Финальная ссылка
+    printf '  Запускаю alexbers... '
+    $COMPOSE up -d --build alexbers >/dev/null 2>&1
+    sleep 5
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
     local hex_domain link
     hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
     link="https://t.me/proxy?server=${DOMAIN}&port=853&secret=ee${BASE_SECRET}${hex_domain}"
 
-    w_msg "Установка завершена" "FakeTLS-ссылка:\n\n${link}\n\n\
-Что осталось вручную в Telegram:\n\
-1. @MTProxybot → /newproxy\n\
-2. Введи: ${DOMAIN}:853\n\
-3. Введи секрет: ${BASE_SECRET}\n\
-4. Сохрани AD_TAG из ответа бота\n\
-5. /myproxies → выбери прокси → Set promoted channel → @канал\n\
-6. Вернись в это меню → Установить прокси, впиши AD_TAG" 22
+    printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
+    printf '%sFakeTLS-ссылка:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
+
+    printf '%sЧто осталось вручную:%s\n' "$C_BLD" "$C_RST"
+    printf '  1. @MTProxybot → /newproxy\n'
+    printf '  2. Введи: %s:853\n' "$DOMAIN"
+    printf '  3. Введи секрет: %s\n' "$BASE_SECRET"
+    printf '  4. Сохрани AD_TAG из ответа бота\n'
+    printf '  5. /myproxies → выбери прокси → Set promoted channel → @канал\n'
+    printf '  6. Вернись сюда → Установить прокси, впиши AD_TAG\n'
+
+    pause
 }
 
-# ============ SECURITY MODULE ============
+# ============ ACTIONS: SECURITY ============
 
-mod_security() {
+action_security() {
+    print_header
+    printf '%s═══ Настройка безопасности ═══%s\n\n' "$C_BLD" "$C_RST"
+
     detect_ssh_port
 
-    w_yesno "Безопасность" "Запустить настройку безопасности?\n\n\
-SSH-порт обнаружен: ${SSH_PORT}\n\n\
-Будет:\n\
-- Просканированы открытые порты\n\
-- Про каждый незнакомый порт спросим\n\
-- Настроен файрвол ufw\n\
-- Установлен fail2ban\n\
-- Включены автообновления\n\
-- Применены sysctl-настройки" 18 || return
+    printf 'SSH-порт обнаружен: %s%s%s\n\n' "$C_BLD" "$SSH_PORT" "$C_RST"
+    printf 'Будет:\n'
+    printf '  • просканированы открытые порты\n'
+    printf '  • про каждый незнакомый порт спросим\n'
+    printf '  • настроен файрвол ufw\n'
+    printf '  • установлен fail2ban\n'
+    printf '  • включены автообновления безопасности\n'
+    printf '  • применены sysctl-настройки\n\n'
 
-    # Сканируем порты
+    if ! confirm "Запустить?" Y; then
+        return
+    fi
+
+    printf '\n%sСканирую открытые порты...%s\n' "$C_DIM" "$C_RST"
     local listening_ports=()
     while IFS= read -r line; do
         local port
@@ -214,7 +376,6 @@ SSH-порт обнаружен: ${SSH_PORT}\n\n\
     local unique_ports
     unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
 
-    # Whitelist
     local whitelist=("$SSH_PORT" 80 443 853)
     is_whitelisted() {
         local p="$1"
@@ -224,7 +385,6 @@ SSH-порт обнаружен: ${SSH_PORT}\n\n\
         return 1
     }
 
-    # Спрашиваем про каждый незнакомый порт
     local extra_open=()
     while IFS= read -r port; do
         [[ -z "$port" ]] && continue
@@ -232,41 +392,47 @@ SSH-порт обнаружен: ${SSH_PORT}\n\n\
             local proc
             proc=$(ss -tlnp 2>/dev/null | awk -v p=":$port " '$0 ~ p {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
             [[ -z "$proc" ]] && proc="(неизвестно)"
-            if whiptail --backtitle "$BT" --title "Незнакомый порт" \
-                --yesno "Порт ${port} сейчас слушается процессом:\n\n${proc}\n\nОставить открытым в файрволе?\n\n(Нет — порт будет закрыт извне)" 13 70; then
+            printf '\n%sПорт %s%s слушается процессом:\n' "$C_YLW" "$port" "$C_RST"
+            printf '  %s\n' "$proc"
+            if confirm "Оставить открытым в файрволе?" N; then
                 extra_open+=("$port")
             fi
         fi
     done <<< "$unique_ports"
 
-    # Применяем настройки
-    (
-        echo "5"; echo "# Устанавливаю ufw..."
-        apt install -y ufw >/dev/null 2>&1
+    printf '\n%sПрименяю настройки:%s\n' "$C_BLD" "$C_RST"
 
-        echo "15"; echo "# Сбрасываю старые правила..."
-        ufw --force reset >/dev/null 2>&1
-        ufw default deny incoming >/dev/null 2>&1
-        ufw default allow outgoing >/dev/null 2>&1
+    printf '  Устанавливаю ufw... '
+    apt install -y ufw >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "25"; echo "# Открываю SSH (${SSH_PORT})..."
-        ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1
+    printf '  Сбрасываю старые правила... '
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "35"; echo "# Открываю порты прокси..."
-        ufw allow 80/tcp comment "Caddy HTTP" >/dev/null 2>&1
-        ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1
-        ufw allow 853/tcp comment "MTProto" >/dev/null 2>&1
+    printf '  Открываю порты: '
+    ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1
+    ufw allow 80/tcp comment "Caddy HTTP" >/dev/null 2>&1
+    ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1
+    ufw allow 853/tcp comment "MTProto" >/dev/null 2>&1
+    for port in "${extra_open[@]}"; do
+        ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1
+    done
+    printf '%s%s 80 443 853%s' "$C_CYN" "$SSH_PORT" "$C_RST"
+    if [[ ${#extra_open[@]} -gt 0 ]]; then
+        printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
+    fi
+    printf ' %sok%s\n' "$C_GRN" "$C_RST"
 
-        for port in "${extra_open[@]}"; do
-            ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1
-        done
+    printf '  Активирую файрвол... '
+    ufw --force enable >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "45"; echo "# Активирую файрвол..."
-        ufw --force enable >/dev/null 2>&1
-
-        echo "55"; echo "# Устанавливаю fail2ban..."
-        apt install -y fail2ban >/dev/null 2>&1
-        cat > /etc/fail2ban/jail.local <<EOF
+    printf '  Устанавливаю fail2ban... '
+    apt install -y fail2ban >/dev/null 2>&1
+    cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -281,17 +447,18 @@ logpath = /var/log/auth.log
 maxretry = 3
 bantime = 3600
 EOF
-        systemctl enable fail2ban >/dev/null 2>&1
-        systemctl restart fail2ban >/dev/null 2>&1
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "75"; echo "# Настраиваю автообновления..."
-        apt install -y unattended-upgrades >/dev/null 2>&1
-        cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+    printf '  Настраиваю автообновления... '
+    apt install -y unattended-upgrades >/dev/null 2>&1
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-        cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
 };
@@ -302,11 +469,12 @@ Unattended-Upgrade::Package-Blacklist {
     "docker.io";
 };
 EOF
-        systemctl enable unattended-upgrades >/dev/null 2>&1
-        systemctl restart unattended-upgrades >/dev/null 2>&1
+    systemctl enable unattended-upgrades >/dev/null 2>&1
+    systemctl restart unattended-upgrades >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "90"; echo "# Применяю sysctl..."
-        cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+    printf '  Применяю sysctl-настройки... '
+    cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -319,142 +487,266 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
-        sysctl --system >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-        echo "100"; echo "# Готово!"
-        sleep 1
-    ) | whiptail --backtitle "$BT" --title "Настройка безопасности" --gauge "Применяю..." 8 70 0
-
-    # Сводка
-    local extra_str=""
-    if [[ ${#extra_open[@]} -gt 0 ]]; then
-        extra_str="Дополнительно открыто: ${extra_open[*]}\n"
-    else
-        extra_str="Дополнительные порты: нет\n"
-    fi
-
-    w_msg "Безопасность настроена" "Открытые порты:\n\
-  SSH:     ${SSH_PORT}\n\
-  HTTP:    80\n\
-  HTTPS:   443\n\
-  MTProto: 853\n\
-${extra_str}\n\
-fail2ban: бан 1 час после 3 попыток\n\
-Автообновления: security-патчи, рестарт 04:00\n\
-sysctl: защита от спуфинга, SYN-flood, MITM" 20
+    printf '\n%s═══ Готово ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
+    pause
 }
 
-# ============ MANAGEMENT MODULE ============
+# ============ ACTIONS: MANAGEMENT ============
 
-mod_manage() {
+action_status() {
+    print_header
+    printf '%s═══ Статус контейнеров ═══%s\n\n' "$C_BLD" "$C_RST"
     detect_compose
     if [[ -z "$COMPOSE" ]]; then
-        w_msg "Ошибка" "Docker не установлен. Сначала установи прокси."
-        return
+        fail_inline "Docker не установлен"
+    else
+        $COMPOSE ps 2>&1 || true
     fi
-
-    while true; do
-        local choice
-        choice=$(w_menu "Управление прокси" "Выбери действие:" \
-            1 "Статус контейнеров" \
-            2 "Логи alexbers (50 строк)" \
-            3 "Логи Caddy (30 строк)" \
-            4 "Перезапустить alexbers" \
-            5 "Перезапустить всё" \
-            6 "Остановить всё" \
-            7 "Запустить всё" \
-            8 "Назад") || return
-
-        case $choice in
-            1) $COMPOSE ps > /tmp/mgr.txt 2>&1; w_scroll "Статус контейнеров" /tmp/mgr.txt; rm -f /tmp/mgr.txt;;
-            2) $COMPOSE logs --tail 50 alexbers > /tmp/mgr.txt 2>&1; w_scroll "Логи alexbers" /tmp/mgr.txt; rm -f /tmp/mgr.txt;;
-            3) $COMPOSE logs --tail 30 caddy > /tmp/mgr.txt 2>&1; w_scroll "Логи Caddy" /tmp/mgr.txt; rm -f /tmp/mgr.txt;;
-            4) $COMPOSE restart alexbers >/dev/null 2>&1; w_msg "Готово" "alexbers перезапущен";;
-            5) $COMPOSE restart >/dev/null 2>&1; w_msg "Готово" "Всё перезапущено";;
-            6) $COMPOSE down >/dev/null 2>&1; w_msg "Готово" "Всё остановлено";;
-            7) $COMPOSE up -d >/dev/null 2>&1; w_msg "Готово" "Всё запущено";;
-            8|"") return;;
-        esac
-    done
+    pause
 }
 
-# ============ UNINSTALL MODULE ============
+action_logs_alexbers() {
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        print_header
+        fail_inline "Docker не установлен"
+        pause; return
+    fi
+    print_header
+    printf '%s═══ Логи alexbers (live, Ctrl+C — выход) ═══%s\n\n' "$C_BLD" "$C_RST"
+    trap 'true' INT
+    $COMPOSE logs --tail 50 -f alexbers || true
+    trap - INT
+    pause
+}
 
-mod_uninstall() {
-    w_yesno "Удаление" "Удалить ВСЁ?\n\n\
-- Контейнеры и volumes\n\
-- LE-сертификат (caddy_data)\n\
-- Сгенерированные конфиги (Caddyfile, config.py)\n\
-- .env\n\
-- src/ (исходник alexbers)\n\n\
-Шаблоны и manage.sh останутся.\n\n\
-Продолжить?" 16 || return
+action_logs_caddy() {
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        print_header
+        fail_inline "Docker не установлен"
+        pause; return
+    fi
+    print_header
+    printf '%s═══ Логи Caddy (live, Ctrl+C — выход) ═══%s\n\n' "$C_BLD" "$C_RST"
+    trap 'true' INT
+    $COMPOSE logs --tail 30 -f caddy || true
+    trap - INT
+    pause
+}
+
+action_restart() {
+    print_header
+    printf '%s═══ Перезапуск ═══%s\n\n' "$C_BLD" "$C_RST"
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        fail_inline "Docker не установлен"
+        pause; return
+    fi
+    printf 'Перезапускаю контейнеры... '
+    $COMPOSE restart >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+    pause
+}
+
+action_stop() {
+    print_header
+    printf '%s═══ Остановка ═══%s\n\n' "$C_BLD" "$C_RST"
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        fail_inline "Docker не установлен"
+        pause; return
+    fi
+    printf 'Останавливаю всё... '
+    $COMPOSE down >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+    pause
+}
+
+action_start() {
+    print_header
+    printf '%s═══ Запуск ═══%s\n\n' "$C_BLD" "$C_RST"
+    detect_compose
+    if [[ -z "$COMPOSE" ]]; then
+        fail_inline "Docker не установлен"
+        pause; return
+    fi
+    printf 'Запускаю всё... '
+    $COMPOSE up -d >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+    pause
+}
+
+action_show_link() {
+    print_header
+    printf '%s═══ FakeTLS-ссылка для пользователей ═══%s\n\n' "$C_BLD" "$C_RST"
+    if [[ ! -f .env ]]; then
+        fail_inline ".env не найден. Сначала установи прокси."
+        pause; return
+    fi
+
+    local DOMAIN="" BASE_SECRET=""
+    # shellcheck source=/dev/null
+    source .env
+
+    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" ]]; then
+        fail_inline "В .env нет DOMAIN или BASE_SECRET"
+        pause; return
+    fi
+
+    local hex_domain link
+    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=853&secret=ee${BASE_SECRET}${hex_domain}"
+
+    printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
+    printf '%sРаздавай только эту, FakeTLS-форму (она с префиксом ee).%s\n' "$C_DIM" "$C_RST"
+    pause
+}
+
+# ============ ACTIONS: SELF-UPDATE ============
+
+action_self_update() {
+    print_header
+    printf '%s═══ Обновление скрипта ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    if [[ ! -d "${SCRIPT_DIR}/.git" ]]; then
+        fail_inline "${SCRIPT_DIR} не git-репо. Self-update недоступен."
+        pause; return
+    fi
+
+    if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain)" ]]; then
+        fail_inline "В ${SCRIPT_DIR} есть локальные изменения"
+        printf '%sСначала: git -C %s status%s\n' "$C_DIM" "$SCRIPT_DIR" "$C_RST"
+        pause; return
+    fi
+
+    local before after
+    before=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
+
+    printf 'Получаю изменения... '
+    if ! git -C "$SCRIPT_DIR" pull --ff-only --quiet 2>/dev/null; then
+        printf '%sошибка%s\n' "$C_RED" "$C_RST"
+        fail_inline "git pull --ff-only failed"
+        pause; return
+    fi
+    after=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    if [[ "$before" == "$after" ]]; then
+        ok_inline "Уже на последней версии: ${after:0:12}"
+        pause; return
+    fi
+
+    ok_inline "Обновлено: ${before:0:12} → ${after:0:12}"
+
+    local changed
+    changed=$(git -C "$SCRIPT_DIR" diff --name-only "$before" "$after")
+
+    printf '\n%sИзменённые файлы:%s\n' "$C_BLD" "$C_RST"
+    printf '%s\n' "$changed" | sed 's/^/  /'
+
+    if printf '%s' "$changed" | grep -qE '^(docker-compose\.yml|Caddyfile\.template|config\.py\.template)$'; then
+        printf '\n%sИзменились шаблоны или compose.%s\n' "$C_YLW" "$C_RST"
+        if confirm "Перегенерировать конфиги и перезапустить контейнеры?" N; then
+            detect_compose
+            if [[ -n "$COMPOSE" && -f .env ]]; then
+                local DOMAIN="" BASE_SECRET="" AD_TAG=""
+                # shellcheck source=/dev/null
+                source .env
+                sed "s/__DOMAIN__/$DOMAIN/g" Caddyfile.template > Caddyfile
+                if [[ -n "${AD_TAG:-}" ]]; then
+                    sed -e "s/__DOMAIN__/$DOMAIN/g" \
+                        -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                        -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
+                        config.py.template > config.py
+                else
+                    sed -e "s/__DOMAIN__/$DOMAIN/g" \
+                        -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                        config.py.template > config.py
+                fi
+                chmod 600 config.py
+                $COMPOSE up -d --build >/dev/null 2>&1
+                ok_inline "Контейнеры перезапущены"
+            fi
+        fi
+    fi
+
+    if printf '%s' "$changed" | grep -qE '^manage\.sh$'; then
+        printf '\n%sСам manage.sh обновился — перезапусти скрипт чтобы изменения применились.%s\n' "$C_YLW" "$C_RST"
+        pause
+        clear
+        exit 0
+    fi
+
+    pause
+}
+
+# ============ ACTIONS: UNINSTALL ============
+
+action_uninstall() {
+    print_header
+    printf '%s═══ ПОЛНОЕ УДАЛЕНИЕ ═══%s\n\n' "$C_RED$C_BLD" "$C_RST"
+    printf 'Будет:\n'
+    printf '  • остановлены контейнеры\n'
+    printf '  • удалён Docker volume %scaddy_data%s (LE-сертификат!)\n' "$C_RED" "$C_RST"
+    printf '  • удалены сгенерированные конфиги (Caddyfile, config.py)\n'
+    printf '  • удалён .env\n'
+    printf '  • удалена папка src/ (исходник alexbers)\n\n'
+    printf '%sScript-файлы и шаблоны останутся.%s\n' "$C_DIM" "$C_RST"
+    printf '%sUFW и fail2ban НЕ откатываются.%s\n\n' "$C_YLW" "$C_RST"
+
+    if ! confirm "Точно удалить?" N; then
+        return
+    fi
 
     detect_compose
     if [[ -n "$COMPOSE" ]]; then
+        printf 'Останавливаю контейнеры и удаляю volumes... '
         $COMPOSE down -v >/dev/null 2>&1 || true
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
+
+    printf 'Удаляю файлы... '
     rm -f Caddyfile config.py .env
     rm -rf src
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    w_msg "Готово" "Прокси удалён.\n\nДля повторной установки — пункт 'Установить прокси'."
+    printf '\n%s═══ Удалено ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
+    pause
 }
 
-# ============ UPDATE MODULE ============
+# ============ MAIN ============
 
-mod_update() {
-    if [[ ! -d .git ]]; then
-        w_msg "Ошибка" "Папка не является git-репозиторием.\n\nСкрипт обновляется только при клонировании через git."
-        return
-    fi
+main() {
+    require_root
+    ensure_deps
 
-    w_yesno "Обновление" "Обновить скрипт из GitHub?\n\nЛокальные изменения скрипта могут быть перезаписаны.\nКонфиги (.env, config.py, Caddyfile) не трогаются." 12 || return
-
-    (
-        echo "20"; echo "# Получаю изменения с GitHub..."
-        git fetch origin >/dev/null 2>&1
-
-        echo "60"; echo "# Применяю обновление..."
-        git reset --hard origin/main >/dev/null 2>&1
-
-        echo "100"; echo "# Готово!"
-        sleep 1
-    ) | whiptail --backtitle "$BT" --title "Обновление" --gauge "Обновляю..." 8 70 0
-
-    local current_commit
-    current_commit=$(git log -1 --oneline 2>/dev/null || echo "?")
-
-    w_msg "Обновлено" "Скрипт обновлён до последней версии.\n\nТекущий коммит:\n${current_commit}\n\nПерезапусти manage.sh чтобы изменения применились."
-    clear
-    exit 0
-}
-
-# ============ MAIN MENU ============
-
-main_menu() {
     while true; do
+        print_header
+        print_status
+        print_menu
+        printf '%sВыбор:%s ' "$C_BLD" "$C_RST"
         local choice
-        choice=$(w_menu "MTProto Proxy Manager" "Выбери действие:" \
-            1 "Установить прокси" \
-            2 "Настроить безопасность VPS" \
-            3 "Управление прокси" \
-            4 "Обновить скрипт из git" \
-            5 "Удалить всё" \
-            6 "Выход") || { clear; exit 0; }
-
-        case $choice in
-            1) mod_deploy ;;
-            2) mod_security ;;
-            3) mod_manage ;;
-            4) mod_update ;;
-            5) mod_uninstall ;;
-            6|"") clear; exit 0 ;;
+        read -r choice </dev/tty || { clear; exit 0; }
+        case "$choice" in
+            1)  action_deploy ;;
+            2)  action_security ;;
+            3)  action_status ;;
+            4)  action_logs_alexbers ;;
+            5)  action_logs_caddy ;;
+            6)  action_restart ;;
+            7)  action_stop ;;
+            8)  action_start ;;
+            9)  action_show_link ;;
+            10) action_self_update ;;
+            11) action_uninstall ;;
+            0|q|Q|exit|"") clear; exit 0 ;;
+            *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
     done
 }
 
-# ============ ENTRY ============
-
-ensure_root
-ensure_deps
-main_menu
+main "$@"
