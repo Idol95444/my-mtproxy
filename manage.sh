@@ -192,23 +192,46 @@ check_dns_health() {
         printf '  %s✓%s Google DNS видит: %s\n' "$C_GRN" "$C_RST" "$google_ip"
     fi
 
-    # 5. Порт 80 свободен (нужен Caddy для ACME-challenge)
-    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ':80$'; then
-        local port_user
-        port_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
-        printf '  %s⚠%s Порт 80 уже занят: %s\n' "$C_YLW" "$C_RST" "${port_user:-неизвестный процесс}"
-        printf '      Если это не Caddy от прошлой попытки — может помешать LE.\n'
-        warnings=$((warnings+1))
+    # 5. Порт 80 — критично для ACME-challenge и Caddy
+    local p80_user
+    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+    if [[ -n "$p80_user" ]]; then
+        # Если это наш же Caddy от прошлой попытки — это нормально
+        if echo "$p80_user" | grep -qE '"caddy"|"docker-proxy"'; then
+            printf '  %s⚠%s Порт 80 занят Caddy (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p80_user"
+            warnings=$((warnings+1))
+        else
+            printf '  %s✗%s Порт 80 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p80_user"
+            errors=$((errors+1))
+        fi
     else
         printf '  %s✓%s Порт 80 свободен\n' "$C_GRN" "$C_RST"
     fi
 
-    # 6. Порт 443 свободен (нужен Caddy для TLS)
-    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
-        local port_user
-        port_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
-        printf '  %s⚠%s Порт 443 уже занят: %s\n' "$C_YLW" "$C_RST" "${port_user:-неизвестный процесс}"
-        warnings=$((warnings+1))
+    # 6. Порт 443 — критично для TLS-маскировки и LE TLS-ALPN-01
+    local p443_user
+    p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+    if [[ -n "$p443_user" ]]; then
+        if echo "$p443_user" | grep -qE '"caddy"|"docker-proxy"'; then
+            printf '  %s⚠%s Порт 443 занят Caddy (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p443_user"
+            warnings=$((warnings+1))
+        else
+            # Распознаём типичные конфликты
+            local hint=""
+            if echo "$p443_user" | grep -qE '"rw-core"|"remnawave"'; then
+                hint="Remnawave — у тебя на этом VPS уже стоит узел Remnawave."
+            elif echo "$p443_user" | grep -qE '"nginx"'; then
+                hint="nginx — отключи или убери его с 443."
+            elif echo "$p443_user" | grep -qE '"haproxy"'; then
+                hint="haproxy — отключи или убери его с 443."
+            elif echo "$p443_user" | grep -qE '"xray"|"v2ray"|"singbox"|"sing-box"'; then
+                hint="Xray/V2Ray/sing-box — другой прокси уже использует 443."
+            fi
+            printf '  %s✗%s Порт 443 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p443_user"
+            [[ -n "$hint" ]] && printf '      %s%s%s\n' "$C_YLW" "$hint" "$C_RST"
+            printf '      %sCaddy не сможет занять 443 → cert не выпустится.%s\n' "$C_DIM" "$C_RST"
+            errors=$((errors+1))
+        fi
     else
         printf '  %s✓%s Порт 443 свободен\n' "$C_GRN" "$C_RST"
     fi
@@ -383,8 +406,19 @@ action_deploy() {
 
     # Развёрнутая проверка DNS, IP, портов
     if ! check_dns_health "$DOMAIN"; then
-        printf '\n'
-        if ! confirm "Продолжить несмотря на ошибки?" N; then
+        printf '\n%sЧто делать:%s\n' "$C_BLD" "$C_RST"
+        printf '  • Если порт 80/443 занят %sRemnawave (rw-core)%s, %snginx%s или другим прокси —\n' \
+            "$C_YLW" "$C_RST" "$C_YLW" "$C_RST"
+        printf '    у тебя архитектурный конфликт. Варианты:\n'
+        printf '    1) Развернуть MTProto на отдельном VPS (рекомендую)\n'
+        printf '    2) Временно остановить конфликтующий сервис, получить cert,\n'
+        printf '       запустить его обратно — но Caddy не сможет автообновить cert\n'
+        printf '       через 60 дней (придётся повторить вручную)\n'
+        printf '    3) Перенастроить Remnawave/прокси чтобы 443 уступал Caddy\n'
+        printf '       (сложно, не покрывается этим скриптом)\n'
+        printf '  • Если несколько A-записей у домена — оставь только одну на этот VPS\n'
+        printf '  • Если DNS не пропагировал — подожди 5-10 минут и повтори проверку\n\n'
+        if ! confirm "Продолжить несмотря на ошибки? (НЕ рекомендую)" N; then
             return
         fi
     fi
