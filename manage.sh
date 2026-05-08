@@ -339,33 +339,66 @@ MENU
 # ============ ACTIONS: CHECK DOMAIN ============
 
 action_check_domain() {
+    # Дефолт из .env если есть
+    local DOMAIN=""
+    if [[ -f .env ]]; then
+        local _D=""
+        # shellcheck source=/dev/null
+        source .env 2>/dev/null || true
+        DOMAIN="${DOMAIN:-}"
+    fi
+
+    # Первый ввод домена
     print_header
     printf '%s═══ Проверка домена ═══%s\n\n' "$C_BLD" "$C_RST"
     printf '%sПроверим всё что нужно для выпуска LE-сертификата.%s\n' "$C_DIM" "$C_RST"
     printf '%sНичего не устанавливается и не меняется.%s\n\n' "$C_DIM" "$C_RST"
 
-    # Дефолт из .env если есть
-    local existing_domain=""
-    if [[ -f .env ]]; then
-        local DOMAIN=""
-        # shellcheck source=/dev/null
-        source .env 2>/dev/null || true
-        existing_domain="${DOMAIN:-}"
-    fi
-
-    local DOMAIN
-    DOMAIN=$(prompt_value "Домен для проверки" "$existing_domain")
+    DOMAIN=$(prompt_value "Домен для проверки" "$DOMAIN")
     if [[ -z "$DOMAIN" ]]; then
         fail_inline "Домен не может быть пустым"
         pause; return
     fi
 
-    if check_dns_health "$DOMAIN"; then
-        printf '\n%sДомен готов к выпуску сертификата.%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '\n%sДо устранения ошибок Let'"'"'s Encrypt cert не выпустит.%s\n' "$C_RED" "$C_RST"
-    fi
-    pause
+    # Цикл: проверка → выбор действия → повтор
+    while true; do
+        print_header
+        printf '%s═══ Проверка домена: %s%s%s ═══%s\n' "$C_BLD" "$C_CYN" "$DOMAIN" "$C_RST$C_BLD" "$C_RST"
+
+        if check_dns_health "$DOMAIN"; then
+            printf '\n%sДомен готов к выпуску сертификата.%s\n' "$C_GRN" "$C_RST"
+        else
+            printf '\n%sДо устранения ошибок Let'"'"'s Encrypt cert не выпустит.%s\n' "$C_RED" "$C_RST"
+        fi
+
+        printf '\n%s───────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+        printf '  %sr)%s Обновить — повторить проверку (DNS мог пропагировать)\n' "$C_CYN" "$C_RST"
+        printf '  %sd)%s Сменить домен\n' "$C_CYN" "$C_RST"
+        printf '  %s0)%s Назад в меню\n\n' "$C_DIM" "$C_RST"
+        printf '%sВыбор:%s ' "$C_BLD" "$C_RST"
+
+        local choice
+        read -r choice </dev/tty || return
+        case "$choice" in
+            r|R|"")
+                continue
+                ;;
+            d|D)
+                local new_domain
+                new_domain=$(prompt_value "Новый домен" "$DOMAIN")
+                if [[ -n "$new_domain" ]]; then
+                    DOMAIN="$new_domain"
+                fi
+                ;;
+            0|q|Q|exit)
+                return
+                ;;
+            *)
+                printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ============ ACTIONS: DEPLOY ============
