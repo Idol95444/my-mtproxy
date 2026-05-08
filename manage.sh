@@ -730,19 +730,36 @@ action_self_update() {
         pause; return
     fi
 
-    if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain)" ]]; then
-        fail_inline "В ${SCRIPT_DIR} есть локальные изменения"
-        printf '%sСначала: git -C %s status%s\n' "$C_DIM" "$SCRIPT_DIR" "$C_RST"
-        pause; return
+    # Если есть локальные изменения — показать и предложить сбросить
+    local local_changes
+    local_changes=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)
+    if [[ -n "$local_changes" ]]; then
+        printf '%sНайдены локальные изменения:%s\n' "$C_YLW" "$C_RST"
+        echo "$local_changes" | sed 's/^/  /'
+        printf '\n%sТипично это правка прав файлов, окончаний строк (CRLF/LF) или ручные правки.%s\n' \
+            "$C_DIM" "$C_RST"
+        printf '%sСбросить и подтянуть свежую версию с GitHub?%s\n' "$C_BLD" "$C_RST"
+        if ! confirm "Сбросить локальные изменения" Y; then
+            pause; return
+        fi
+        printf 'Сбрасываю локальные изменения... '
+        git -C "$SCRIPT_DIR" reset --hard HEAD >/dev/null 2>&1
+        git -C "$SCRIPT_DIR" clean -fd >/dev/null 2>&1
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
 
     local before after
     before=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
 
     printf 'Получаю изменения... '
-    if ! git -C "$SCRIPT_DIR" pull --ff-only --quiet 2>/dev/null; then
+    if ! git -C "$SCRIPT_DIR" fetch origin --quiet 2>/dev/null; then
         printf '%sошибка%s\n' "$C_RED" "$C_RST"
-        fail_inline "git pull --ff-only failed"
+        fail_inline "git fetch failed — проверь интернет/доступ к GitHub"
+        pause; return
+    fi
+    if ! git -C "$SCRIPT_DIR" reset --hard origin/main >/dev/null 2>&1; then
+        printf '%sошибка%s\n' "$C_RED" "$C_RST"
+        fail_inline "git reset failed"
         pause; return
     fi
     after=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
