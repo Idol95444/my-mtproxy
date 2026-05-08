@@ -51,6 +51,31 @@ ensure_deps() {
     fi
 }
 
+# Создаёт симлинк /usr/local/bin/proxy → этот скрипт.
+# При следующем запуске можно будет писать просто `sudo proxy` из любого места.
+ensure_shortcut() {
+    local target="/usr/local/bin/proxy"
+    local script_path="${SCRIPT_DIR}/manage.sh"
+
+    # Уже установлен и указывает сюда — ничего не делаем
+    if [[ -L "$target" ]] && [[ "$(readlink -f "$target" 2>/dev/null)" == "$script_path" ]]; then
+        return 0
+    fi
+
+    # Что-то другое лежит по этому пути — не трогаем
+    if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
+        return 0
+    fi
+
+    # Если есть устаревший симлинк — обновим, иначе создаём с нуля
+    chmod +x "$script_path" 2>/dev/null || true
+    if ln -sf "$script_path" "$target" 2>/dev/null; then
+        printf '%s✓%s Установлена команда %ssudo proxy%s — запускай из любого места\n' \
+            "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
+        sleep 1
+    fi
+}
+
 detect_compose() {
     if docker compose version &>/dev/null; then
         COMPOSE="docker compose"
@@ -990,6 +1015,14 @@ action_uninstall() {
     rm -rf src
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
+    # Удалить симлинк /usr/local/bin/proxy если он наш
+    if [[ -L /usr/local/bin/proxy ]] && \
+       [[ "$(readlink -f /usr/local/bin/proxy 2>/dev/null)" == "${SCRIPT_DIR}/manage.sh" ]]; then
+        printf '  Удаляю команду /usr/local/bin/proxy... '
+        rm -f /usr/local/bin/proxy
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    fi
+
     # === ЭТАП 2: Безопасность ===
     if $revert_security; then
         if command -v ufw >/dev/null 2>&1; then
@@ -1052,6 +1085,7 @@ action_uninstall() {
 main() {
     require_root
     ensure_deps
+    ensure_shortcut
 
     while true; do
         print_header
