@@ -291,25 +291,58 @@ STATUS
 print_menu() {
     cat <<MENU
 ${C_BLD}═══ УСТАНОВКА ═══${C_RST}
-  ${C_CYN}1)${C_RST} Установить прокси            ${C_DIM}(домен, секрет, AD_TAG)${C_RST}
-  ${C_CYN}2)${C_RST} Настроить безопасность VPS   ${C_DIM}(ufw, fail2ban, sysctl)${C_RST}
+  ${C_CYN}1)${C_RST} Проверить домен              ${C_DIM}(DNS, IP, порты — без установки)${C_RST}
+  ${C_CYN}2)${C_RST} Установить прокси            ${C_DIM}(домен, секрет, AD_TAG)${C_RST}
+  ${C_CYN}3)${C_RST} Настроить безопасность VPS   ${C_DIM}(ufw, fail2ban, sysctl)${C_RST}
 
 ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
-  ${C_CYN}3)${C_RST} Статус контейнеров
-  ${C_CYN}4)${C_RST} Логи alexbers                ${C_DIM}(live, Ctrl+C — выход)${C_RST}
-  ${C_CYN}5)${C_RST} Логи Caddy                   ${C_DIM}(live, Ctrl+C — выход)${C_RST}
-  ${C_CYN}6)${C_RST} Перезапустить прокси
-  ${C_CYN}7)${C_RST} Остановить всё
-  ${C_CYN}8)${C_RST} Запустить всё
-  ${C_CYN}9)${C_RST} Показать ссылку для пользователей
+  ${C_CYN}4)${C_RST} Статус контейнеров
+  ${C_CYN}5)${C_RST} Логи alexbers                ${C_DIM}(live, Ctrl+C — выход)${C_RST}
+  ${C_CYN}6)${C_RST} Логи Caddy                   ${C_DIM}(live, Ctrl+C — выход)${C_RST}
+  ${C_CYN}7)${C_RST} Перезапустить прокси
+  ${C_CYN}8)${C_RST} Остановить всё
+  ${C_CYN}9)${C_RST} Запустить всё
+  ${C_CYN}10)${C_RST} Показать ссылку для пользователей
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
-  ${C_CYN}10)${C_RST} Обновить скрипт из git
-  ${C_CYN}11)${C_RST} Удалить прокси
+  ${C_CYN}11)${C_RST} Обновить скрипт из git
+  ${C_CYN}12)${C_RST} Удалить прокси
 
   ${C_DIM}0) Выход${C_RST}
 
 MENU
+}
+
+# ============ ACTIONS: CHECK DOMAIN ============
+
+action_check_domain() {
+    print_header
+    printf '%s═══ Проверка домена ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%sПроверим всё что нужно для выпуска LE-сертификата.%s\n' "$C_DIM" "$C_RST"
+    printf '%sНичего не устанавливается и не меняется.%s\n\n' "$C_DIM" "$C_RST"
+
+    # Дефолт из .env если есть
+    local existing_domain=""
+    if [[ -f .env ]]; then
+        local DOMAIN=""
+        # shellcheck source=/dev/null
+        source .env 2>/dev/null || true
+        existing_domain="${DOMAIN:-}"
+    fi
+
+    local DOMAIN
+    DOMAIN=$(prompt_value "Домен для проверки" "$existing_domain")
+    if [[ -z "$DOMAIN" ]]; then
+        fail_inline "Домен не может быть пустым"
+        pause; return
+    fi
+
+    if check_dns_health "$DOMAIN"; then
+        printf '\n%sДомен готов к выпуску сертификата.%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '\n%sДо устранения ошибок Let'"'"'s Encrypt cert не выпустит.%s\n' "$C_RED" "$C_RST"
+    fi
+    pause
 }
 
 # ============ ACTIONS: DEPLOY ============
@@ -862,17 +895,18 @@ main() {
         local choice
         read -r choice </dev/tty || { clear; exit 0; }
         case "$choice" in
-            1)  action_deploy ;;
-            2)  action_security ;;
-            3)  action_status ;;
-            4)  action_logs_alexbers ;;
-            5)  action_logs_caddy ;;
-            6)  action_restart ;;
-            7)  action_stop ;;
-            8)  action_start ;;
-            9)  action_show_link ;;
-            10) action_self_update ;;
-            11) action_uninstall ;;
+            1)  action_check_domain ;;
+            2)  action_deploy ;;
+            3)  action_security ;;
+            4)  action_status ;;
+            5)  action_logs_alexbers ;;
+            6)  action_logs_caddy ;;
+            7)  action_restart ;;
+            8)  action_stop ;;
+            9)  action_start ;;
+            10) action_show_link ;;
+            11) action_self_update ;;
+            12) action_uninstall ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
