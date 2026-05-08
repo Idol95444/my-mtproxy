@@ -308,7 +308,7 @@ EOF
             -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
             config.py.template > config.py
     fi
-    chmod 600 config.py
+    chmod 644 config.py
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Запускаю Caddy (получение LE-сертификата)'
@@ -667,7 +667,7 @@ action_self_update() {
                         -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
                         config.py.template > config.py
                 fi
-                chmod 600 config.py
+                chmod 644 config.py
                 $COMPOSE up -d --build >/dev/null 2>&1
                 ok_inline "Контейнеры перезапущены"
             fi
