@@ -886,11 +886,14 @@ action_self_update() {
 action_uninstall() {
     print_header
     printf '%s═══ ПОЛНОЕ УДАЛЕНИЕ ═══%s\n\n' "$C_RED$C_BLD" "$C_RST"
-    printf 'Возврат VPS к состоянию ДО запуска этого скрипта.\n\n'
+    printf 'Возврат VPS к состоянию ДО запуска этого скрипта.\n'
+    printf '%sDocker НЕ удаляется — он может использоваться другими сервисами.%s\n\n' "$C_DIM" "$C_RST"
 
     printf '%sЭтап 1 — Прокси (обязательно):%s\n' "$C_BLD" "$C_RST"
-    printf '  • остановить контейнеры docker compose\n'
-    printf '  • удалить Docker volume caddy_data (LE-сертификат!)\n'
+    printf '  • остановить контейнеры (mtproxy-caddy, mtproto-final)\n'
+    printf '  • удалить Docker volumes (caddy_data — LE-сертификат, caddy_config)\n'
+    printf '  • удалить Docker-образы собранные нами (alexbers)\n'
+    printf '  • удалить Docker network проекта\n'
     printf '  • удалить Caddyfile, config.py, .env\n'
     printf '  • удалить папку src/ (исходник alexbers)\n\n'
 
@@ -900,7 +903,6 @@ action_uninstall() {
 
     # Опциональные этапы
     local revert_security=false
-    local remove_docker=false
     local remove_deps=false
 
     printf '\n%sЭтап 2 — Настройки безопасности (опционально):%s\n' "$C_BLD" "$C_RST"
@@ -912,14 +914,7 @@ action_uninstall() {
         revert_security=true
     fi
 
-    printf '\n%sЭтап 3 — Docker (опционально, осторожно):%s\n' "$C_BLD" "$C_RST"
-    printf '  • %sудалит docker.io и docker-compose%s\n' "$C_RED" "$C_RST"
-    printf '  • %sсломает другие контейнеры если они есть на этом VPS%s\n' "$C_YLW" "$C_RST"
-    if confirm "Удалить Docker?" N; then
-        remove_docker=true
-    fi
-
-    printf '\n%sЭтап 4 — Зависимости скрипта (опционально):%s\n' "$C_BLD" "$C_RST"
+    printf '\n%sЭтап 3 — Зависимости скрипта (опционально):%s\n' "$C_BLD" "$C_RST"
     printf '  • удалить пакеты установленные скриптом: dnsutils, xxd\n'
     printf '  • %sможет помешать другим сервисам — обычно не стоит%s\n' "$C_DIM" "$C_RST"
     if confirm "Удалить зависимости?" N; then
@@ -928,12 +923,33 @@ action_uninstall() {
 
     printf '\n%sПриступаю к удалению...%s\n' "$C_BLD" "$C_RST"
 
-    # === ЭТАП 1: Контейнеры и файлы прокси ===
+    # === ЭТАП 1: Контейнеры, образы, volumes, конфиги ===
     detect_compose
     if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
-        printf '  Останавливаю контейнеры и удаляю volumes... '
-        $COMPOSE down -v >/dev/null 2>&1 || true
+        printf '  Останавливаю контейнеры, удаляю volumes и образы... '
+        # -v убирает volumes (caddy_data!), --rmi local удаляет локально собранные образы
+        $COMPOSE down -v --rmi local --remove-orphans >/dev/null 2>&1 || true
         printf '%sok%s\n' "$C_GRN" "$C_RST"
+    fi
+
+    # На случай если контейнеры остались (создавались вручную или compose выпал)
+    if command -v docker >/dev/null 2>&1; then
+        local stale
+        stale=$(docker ps -a --filter "name=mtproto-final" --filter "name=mtproxy-caddy" -q 2>/dev/null)
+        if [[ -n "$stale" ]]; then
+            printf '  Удаляю осиротевшие контейнеры... '
+            docker rm -f $stale >/dev/null 2>&1 || true
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
+        fi
+
+        # Удаляем volumes по имени (на случай если down -v не сработал)
+        local vols
+        vols=$(docker volume ls -q 2>/dev/null | grep -E '(my-mtproxy|mtproxy)_(caddy_data|caddy_config)' || true)
+        if [[ -n "$vols" ]]; then
+            printf '  Удаляю volumes... '
+            echo "$vols" | xargs -r docker volume rm >/dev/null 2>&1 || true
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
+        fi
     fi
 
     printf '  Удаляю конфиги и исходник... '
@@ -975,21 +991,7 @@ action_uninstall() {
         fi
     fi
 
-    # === ЭТАП 3: Docker ===
-    if $remove_docker; then
-        printf '  Останавливаю Docker... '
-        systemctl stop docker docker.socket >/dev/null 2>&1 || true
-        systemctl disable docker docker.socket >/dev/null 2>&1 || true
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-        printf '  Удаляю Docker-пакеты... '
-        apt remove -y --purge docker.io docker-compose-v2 docker-compose docker-buildx >/dev/null 2>&1 || true
-        apt autoremove -y --purge >/dev/null 2>&1 || true
-        rm -rf /var/lib/docker /etc/docker
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    fi
-
-    # === ЭТАП 4: Зависимости ===
+    # === ЭТАП 3: Зависимости ===
     if $remove_deps; then
         printf '  Удаляю зависимости скрипта... '
         apt remove -y dnsutils xxd >/dev/null 2>&1 || true
@@ -1000,18 +1002,14 @@ action_uninstall() {
 
     # Сводка состояния
     printf '%sСостояние VPS:%s\n' "$C_BLD" "$C_RST"
-    printf '  • Прокси и его конфиги: %sудалены%s\n' "$C_GRN" "$C_RST"
+    printf '  • Прокси, контейнеры, образы, volumes: %sудалены%s\n' "$C_GRN" "$C_RST"
     if $revert_security; then
-        printf '  • Файрвол и hardening:  %sоткачены%s\n' "$C_GRN" "$C_RST"
+        printf '  • Файрвол и hardening:                 %sоткачены%s\n' "$C_GRN" "$C_RST"
     else
-        printf '  • Файрвол и hardening:  %sсохранены%s\n' "$C_DIM" "$C_RST"
+        printf '  • Файрвол и hardening:                 %sсохранены%s\n' "$C_DIM" "$C_RST"
     fi
-    if $remove_docker; then
-        printf '  • Docker:               %sудалён%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '  • Docker:               %sсохранён%s\n' "$C_DIM" "$C_RST"
-    fi
-    printf '\n%sПапка скрипта (manage.sh, шаблоны) осталась — удали вручную:%s\n' "$C_DIM" "$C_RST"
+    printf '  • Docker:                              %sсохранён%s\n' "$C_DIM" "$C_RST"
+    printf '\n%sПапка скрипта (manage.sh, шаблоны) осталась — удали вручную если нужно:%s\n' "$C_DIM" "$C_RST"
     printf '  cd .. && rm -rf %s\n' "$(basename "$SCRIPT_DIR")"
     pause
 }
