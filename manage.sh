@@ -110,6 +110,124 @@ step() {
     printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"
 }
 
+# Проверка домена: правильный ли IP, пропагировал ли DNS, свободен ли порт 80
+# Возвращает 0 если всё ОК, 1 если есть критичные ошибки.
+# Печатает предупреждения но не валит на них (warnings не блокируют).
+check_dns_health() {
+    local domain="$1"
+    local errors=0 warnings=0
+
+    printf '\n%sПроверка DNS и доступности:%s\n' "$C_BLD" "$C_RST"
+
+    # 1. Публичный IP этого сервера
+    local server_ip
+    server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+                curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
+                curl -s --max-time 5 https://icanhazip.com 2>/dev/null)
+    server_ip=$(echo -n "$server_ip" | tr -d '[:space:]')
+    if [[ -z "$server_ip" ]]; then
+        printf '  %s✗ Не удалось определить публичный IP сервера%s\n' "$C_RED" "$C_RST"
+        errors=$((errors+1))
+    else
+        printf '  %s✓%s Публичный IP этого VPS: %s%s%s\n' "$C_GRN" "$C_RST" "$C_BLD" "$server_ip" "$C_RST"
+    fi
+
+    # 2. A-записи через локальный резолвер
+    local resolved_ips
+    resolved_ips=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' || true)
+    if [[ -z "$resolved_ips" ]]; then
+        printf '  %s✗%s Домен %s не резолвится — A-запись не настроена или не пропагировала\n' \
+            "$C_RED" "$C_RST" "$domain"
+        return 1
+    fi
+
+    local ip_count
+    ip_count=$(echo "$resolved_ips" | wc -l | tr -d ' ')
+    if (( ip_count > 1 )); then
+        printf '  %s✗%s У домена несколько A-записей:\n' "$C_RED" "$C_RST"
+        echo "$resolved_ips" | sed "s/^/      /"
+        printf '      %sLet'"'"'s Encrypt проверяет ВСЕ A-записи.%s\n' "$C_YLW" "$C_RST"
+        printf '      %sЕсли хоть одна не отвечает — cert не выпустится.%s\n' "$C_YLW" "$C_RST"
+        printf '      %sОставь только одну запись на этот VPS.%s\n' "$C_YLW" "$C_RST"
+        errors=$((errors+1))
+    else
+        printf '  %s✓%s A-запись (локальный DNS): %s\n' "$C_GRN" "$C_RST" "$resolved_ips"
+    fi
+
+    # 3. Совпадает ли A-запись с IP сервера
+    if [[ -n "$server_ip" ]]; then
+        if echo "$resolved_ips" | grep -qx "$server_ip"; then
+            printf '  %s✓%s Домен указывает на этот сервер\n' "$C_GRN" "$C_RST"
+        else
+            printf '  %s✗%s Ни одна A-запись не указывает на этот сервер!\n' "$C_RED" "$C_RST"
+            printf '      VPS: %s\n' "$server_ip"
+            printf '      DNS: %s\n' "$(echo "$resolved_ips" | tr '\n' ' ')"
+            errors=$((errors+1))
+        fi
+    fi
+
+    # 4. Внешние DNS (Cloudflare и Google) — пропагация
+    local cf_ip google_ip
+    cf_ip=$(dig @1.1.1.1 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+    google_ip=$(dig @8.8.8.8 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+
+    if [[ -z "$cf_ip" ]]; then
+        printf '  %s⚠%s Cloudflare DNS (1.1.1.1) пока не видит домен — DNS не пропагировал\n' \
+            "$C_YLW" "$C_RST"
+        warnings=$((warnings+1))
+    elif [[ -n "$server_ip" && "$cf_ip" != "$server_ip" ]]; then
+        printf '  %s⚠%s Cloudflare DNS видит другой IP: %s\n' "$C_YLW" "$C_RST" "$cf_ip"
+        warnings=$((warnings+1))
+    else
+        printf '  %s✓%s Cloudflare DNS видит: %s\n' "$C_GRN" "$C_RST" "$cf_ip"
+    fi
+
+    if [[ -z "$google_ip" ]]; then
+        printf '  %s⚠%s Google DNS (8.8.8.8) пока не видит домен\n' "$C_YLW" "$C_RST"
+        warnings=$((warnings+1))
+    elif [[ -n "$server_ip" && "$google_ip" != "$server_ip" ]]; then
+        printf '  %s⚠%s Google DNS видит другой IP: %s\n' "$C_YLW" "$C_RST" "$google_ip"
+        warnings=$((warnings+1))
+    else
+        printf '  %s✓%s Google DNS видит: %s\n' "$C_GRN" "$C_RST" "$google_ip"
+    fi
+
+    # 5. Порт 80 свободен (нужен Caddy для ACME-challenge)
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ':80$'; then
+        local port_user
+        port_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+        printf '  %s⚠%s Порт 80 уже занят: %s\n' "$C_YLW" "$C_RST" "${port_user:-неизвестный процесс}"
+        printf '      Если это не Caddy от прошлой попытки — может помешать LE.\n'
+        warnings=$((warnings+1))
+    else
+        printf '  %s✓%s Порт 80 свободен\n' "$C_GRN" "$C_RST"
+    fi
+
+    # 6. Порт 443 свободен (нужен Caddy для TLS)
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
+        local port_user
+        port_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+        printf '  %s⚠%s Порт 443 уже занят: %s\n' "$C_YLW" "$C_RST" "${port_user:-неизвестный процесс}"
+        warnings=$((warnings+1))
+    else
+        printf '  %s✓%s Порт 443 свободен\n' "$C_GRN" "$C_RST"
+    fi
+
+    # Итог
+    printf '\n'
+    if (( errors > 0 )); then
+        printf '  %sНайдено критичных ошибок: %d%s\n' "$C_RED" "$errors" "$C_RST"
+        printf '  %sLet'"'"'s Encrypt с такими настройками cert НЕ выпустит.%s\n' "$C_RED" "$C_RST"
+        return 1
+    fi
+    if (( warnings > 0 )); then
+        printf '  %sПредупреждений: %d (не блокирует, но обрати внимание)%s\n' "$C_YLW" "$warnings" "$C_RST"
+    else
+        printf '  %sВсе проверки пройдены%s\n' "$C_GRN" "$C_RST"
+    fi
+    return 0
+}
+
 # ============ SCREEN ============
 
 print_header() {
@@ -230,17 +348,12 @@ action_deploy() {
     AD_TAG=$(prompt_value "AD_TAG" "$AD_TAG")
     printf '\n'
 
-    # DNS-проверка
-    printf '%sПроверяю DNS...%s ' "$C_DIM" "$C_RST"
-    local resolved
-    resolved=$(dig +short "$DOMAIN" 2>/dev/null | head -1)
-    if [[ -z "$resolved" ]]; then
-        printf '%sне резолвится%s\n' "$C_YLW" "$C_RST"
-        if ! confirm "A-запись точно настроена? Продолжить?" Y; then
+    # Развёрнутая проверка DNS, IP, портов
+    if ! check_dns_health "$DOMAIN"; then
+        printf '\n'
+        if ! confirm "Продолжить несмотря на ошибки?" N; then
             return
         fi
-    else
-        printf '%s%s%s\n' "$C_GRN" "$resolved" "$C_RST"
     fi
 
     printf '\n%sИтого:%s\n' "$C_BLD" "$C_RST"
