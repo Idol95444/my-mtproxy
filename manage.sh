@@ -59,33 +59,51 @@ ensure_deps() {
 
 # Создаёт симлинк /usr/local/bin/proxy → этот скрипт.
 # При следующем запуске можно будет писать просто `sudo proxy` из любого места.
-ensure_shortcut() {
+install_shortcut() {
     local target="/usr/local/bin/proxy"
     local script_path="${SCRIPT_DIR}/manage.sh"
+    local quiet="${1:-noisy}"  # quiet — не печатать ничего если уже установлено
 
-    # Уже установлен и указывает сюда — ничего не делаем
+    # Уже установлен и указывает сюда — выход
     if [[ -L "$target" ]] && [[ "$(readlink -f "$target" 2>/dev/null)" == "$script_path" ]]; then
-        return 0
-    fi
-
-    # Что-то другое лежит по этому пути — не трогаем
-    if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
-        return 0
-    fi
-
-    # Если есть устаревший симлинк — обновим, иначе создаём с нуля
-    chmod +x "$script_path" 2>/dev/null || true
-    if ln -sf "$script_path" "$target" 2>/dev/null; then
-        # Сбрасываем bash hash table — иначе текущий shell всё ещё думает что команды нет
-        hash -r 2>/dev/null || true
-        printf '%s✓%s Установлена команда %ssudo proxy%s — запускай из любого места\n' \
+        [[ "$quiet" == "noisy" ]] && printf '%s✓%s Команда %ssudo proxy%s уже установлена\n' \
             "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
-        printf '%s   Если в текущем терминале %ssudo proxy%s выдаёт "command not found" —\n' \
-            "$C_DIM" "$C_BLD$C_DIM" "$C_DIM"
-        printf '%s   выполни %shash -r%s или открой новую сессию.%s\n' \
-            "$C_DIM" "$C_BLD$C_DIM" "$C_DIM" "$C_RST"
-        sleep 2
+        return 0
     fi
+
+    # Что-то другое лежит — не трогаем
+    if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
+        printf '%s⚠%s По пути %s лежит обычный файл — не трогаю\n' \
+            "$C_YLW" "$C_RST" "$target"
+        return 1
+    fi
+
+    # Делаем сам скрипт исполняемым (для запуска через симлинк)
+    chmod +x "$script_path" 2>/dev/null || true
+
+    # Создаём симлинк
+    if ! ln -sf "$script_path" "$target" 2>/dev/null; then
+        printf '%s✗%s Не удалось создать %s\n' "$C_RED" "$C_RST" "$target"
+        printf '%s   Возможно /usr/local/bin недоступен или не существует.%s\n' "$C_DIM" "$C_RST"
+        return 1
+    fi
+
+    # Сбросить bash hash table в текущем shell
+    hash -r 2>/dev/null || true
+
+    printf '\n%s✓%s Команда %ssudo proxy%s установлена\n' \
+        "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
+    printf '%s   Если в текущем терминале %ssudo proxy%s выдаёт "command not found" —\n' \
+        "$C_DIM" "$C_BLD$C_DIM" "$C_DIM"
+    printf '%s   выполни %shash -r%s или открой новую SSH-сессию.%s\n\n' \
+        "$C_DIM" "$C_BLD$C_DIM" "$C_DIM" "$C_RST"
+    sleep 2
+    return 0
+}
+
+# Тихий вариант для главного цикла — не печатает ничего если всё уже ОК
+ensure_shortcut() {
+    install_shortcut quiet
 }
 
 detect_compose() {
@@ -366,8 +384,10 @@ ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
   ${C_CYN}10)${C_RST} Показать ссылку для пользователей
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
-  ${C_CYN}11)${C_RST} Обновить скрипт из git
-  ${C_CYN}12)${C_RST} Удалить прокси
+  ${C_CYN}11)${C_RST} Обновить систему              ${C_DIM}(apt update && upgrade)${C_RST}
+  ${C_CYN}12)${C_RST} Обновить скрипт из git
+  ${C_CYN}13)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
+  ${C_CYN}14)${C_RST} Удалить прокси
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -874,6 +894,92 @@ action_show_link() {
     pause
 }
 
+# ============ ACTIONS: SYSTEM UPDATE ============
+
+action_system_update() {
+    print_header
+    printf '%s═══ Обновление системы ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf 'Обновит все пакеты Ubuntu/Debian (apt update && apt upgrade).\n'
+    printf '%sМожет занять несколько минут.%s\n\n' "$C_DIM" "$C_RST"
+
+    if ! confirm "Запустить обновление системы?" Y; then
+        return
+    fi
+
+    printf '\n  Обновляю списки пакетов... '
+    if apt update >/dev/null 2>&1; then
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sошибка%s\n' "$C_RED" "$C_RST"
+        printf '%s  Возможно apt занят (unattended-upgrades в фоне)%s\n' "$C_DIM" "$C_RST"
+        pause; return
+    fi
+
+    # Сколько пакетов готово к обновлению
+    local upgradable=0
+    upgradable=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c . || echo 0)
+
+    if [[ "$upgradable" -eq 0 ]]; then
+        printf '\n%s✓%s Все пакеты уже актуальны\n' "$C_GRN" "$C_RST"
+        pause; return
+    fi
+
+    printf '  Доступно обновлений: %s%d%s\n\n' "$C_BLD" "$upgradable" "$C_RST"
+
+    if ! confirm "Установить обновления?" Y; then
+        return
+    fi
+
+    printf '\n%sУстанавливаю обновления (вывод apt не подавляется):%s\n\n' "$C_BLD" "$C_RST"
+    DEBIAN_FRONTEND=noninteractive apt -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        upgrade || {
+        fail_inline "apt upgrade завершился с ошибкой"
+        pause; return
+    }
+
+    printf '\n  Удаляю неиспользуемые пакеты... '
+    apt autoremove -y >/dev/null 2>&1 || true
+    apt autoclean >/dev/null 2>&1 || true
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # Проверка нужен ли ребут
+    if [[ -f /var/run/reboot-required ]]; then
+        printf '\n%s⚠%s Требуется перезагрузка (обновлено ядро или libc)\n' "$C_YLW" "$C_RST"
+        if [[ -f /var/run/reboot-required.pkgs ]]; then
+            printf '%s   Из-за обновления:%s\n' "$C_DIM" "$C_RST"
+            sed 's/^/     /' /var/run/reboot-required.pkgs
+        fi
+        printf '\n'
+        if confirm "Перезагрузить сейчас?" N; then
+            printf '%sПерезагрузка через 5 сек... (Ctrl+C — отмена)%s\n' "$C_YLW" "$C_RST"
+            sleep 5
+            systemctl reboot
+            exit 0
+        else
+            printf '%sПерезагрузи позже сам:%s sudo reboot\n' "$C_DIM" "$C_RST"
+        fi
+    fi
+
+    printf '\n%s═══ Обновление системы завершено ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
+    pause
+}
+
+# ============ ACTIONS: INSTALL SHORTCUT ============
+
+action_install_shortcut() {
+    print_header
+    printf '%s═══ Установка команды proxy ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf 'Создаст симлинк %s/usr/local/bin/proxy%s → %s\n' \
+        "$C_BLD" "$C_RST" "${SCRIPT_DIR}/manage.sh"
+    printf 'После — можно запускать %ssudo proxy%s из любой папки.\n\n' "$C_BLD" "$C_RST"
+
+    install_shortcut noisy
+
+    pause
+}
+
 # ============ ACTIONS: SELF-UPDATE ============
 
 action_self_update() {
@@ -1135,8 +1241,10 @@ main() {
             8)  action_stop ;;
             9)  action_start ;;
             10) action_show_link ;;
-            11) action_self_update ;;
-            12) action_uninstall ;;
+            11) action_system_update ;;
+            12) action_self_update ;;
+            13) action_install_shortcut ;;
+            14) action_uninstall ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
