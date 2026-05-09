@@ -667,7 +667,7 @@ action_security() {
             [[ -z "$proc" ]] && proc="(неизвестно)"
             printf '\n%sПорт %s%s слушается процессом:\n' "$C_YLW" "$port" "$C_RST"
             printf '  %s\n' "$proc"
-            if confirm "Оставить открытым в файрволе?" N; then
+            if confirm "Оставить открытым в файрволе?" Y; then
                 extra_open+=("$port")
             fi
         fi
