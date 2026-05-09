@@ -35,7 +35,11 @@ SSH_PORT="22"
 
 require_root() {
     [[ $EUID -eq 0 ]] || {
-        printf '%sЗапусти от root: sudo bash manage.sh%s\n' "$C_RED" "$C_RST"
+        if [[ -L /usr/local/bin/proxy ]]; then
+            printf '%sЗапусти от root:%s sudo proxy\n' "$C_RED" "$C_RST"
+        else
+            printf '%sЗапусти от root:%s sudo bash manage.sh\n' "$C_RED" "$C_RST"
+        fi
         exit 1
     }
 }
@@ -72,9 +76,15 @@ ensure_shortcut() {
     # Если есть устаревший симлинк — обновим, иначе создаём с нуля
     chmod +x "$script_path" 2>/dev/null || true
     if ln -sf "$script_path" "$target" 2>/dev/null; then
+        # Сбрасываем bash hash table — иначе текущий shell всё ещё думает что команды нет
+        hash -r 2>/dev/null || true
         printf '%s✓%s Установлена команда %ssudo proxy%s — запускай из любого места\n' \
             "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
-        sleep 1
+        printf '%s   Если в текущем терминале %ssudo proxy%s выдаёт "command not found" —\n' \
+            "$C_DIM" "$C_BLD$C_DIM" "$C_DIM"
+        printf '%s   выполни %shash -r%s или открой новую сессию.%s\n' \
+            "$C_DIM" "$C_BLD$C_DIM" "$C_DIM" "$C_RST"
+        sleep 2
     fi
 }
 
