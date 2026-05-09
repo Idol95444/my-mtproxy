@@ -7,7 +7,7 @@
 
 ```bash
 # На свежем VPS (Ubuntu 22.04+ / Debian 12, под root):
-git clone https://github.com/Idol95444/my-mtproxy.git
+git clone https://github.com/limbo-wh/my-mtproxy.git
 cd my-mtproxy
 sudo bash manage.sh
 ```
