@@ -611,8 +611,10 @@ action_security() {
         [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && listening_ports+=("$port")
     done < <(ss -tln 2>/dev/null | tail -n +2)
 
-    local unique_ports
-    unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
+    local unique_ports=""
+    if [[ ${#listening_ports[@]} -gt 0 ]]; then
+        unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
+    fi
 
     local whitelist=("$SSH_PORT" 80 443 853)
     is_whitelisted() {
@@ -640,23 +642,32 @@ action_security() {
 
     printf '\n%sПрименяю настройки:%s\n' "$C_BLD" "$C_RST"
 
-    printf '  Устанавливаю ufw... '
-    apt install -y ufw >/dev/null 2>&1
+    printf '  Обновляю apt... '
+    apt update >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
+    printf '  Устанавливаю ufw... '
+    if apt install -y ufw >/dev/null 2>&1; then
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sошибка (возможно apt занят)%s\n' "$C_RED" "$C_RST"
+        pause; return
+    fi
+
     printf '  Сбрасываю старые правила... '
-    ufw --force reset >/dev/null 2>&1
-    ufw default deny incoming >/dev/null 2>&1
-    ufw default allow outgoing >/dev/null 2>&1
+    ufw --force reset >/dev/null 2>&1 || true
+    ufw default deny incoming >/dev/null 2>&1 || true
+    ufw default allow outgoing >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Открываю порты: '
-    ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1
-    ufw allow 80/tcp comment "Caddy HTTP" >/dev/null 2>&1
-    ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1
-    ufw allow 853/tcp comment "MTProto" >/dev/null 2>&1
-    for port in "${extra_open[@]}"; do
-        ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1
+    ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
+    ufw allow 80/tcp comment "Caddy HTTP" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1 || true
+    ufw allow 853/tcp comment "MTProto" >/dev/null 2>&1 || true
+    for port in "${extra_open[@]:-}"; do
+        [[ -z "$port" ]] && continue
+        ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
     done
     printf '%s%s 80 443 853%s' "$C_CYN" "$SSH_PORT" "$C_RST"
     if [[ ${#extra_open[@]} -gt 0 ]]; then
@@ -665,12 +676,12 @@ action_security() {
     printf ' %sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Активирую файрвол... '
-    ufw --force enable >/dev/null 2>&1
+    ufw --force enable >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Устанавливаю fail2ban... '
-    apt install -y fail2ban >/dev/null 2>&1
-    cat > /etc/fail2ban/jail.local <<EOF
+    if apt install -y fail2ban >/dev/null 2>&1; then
+        cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -685,18 +696,21 @@ logpath = /var/log/auth.log
 maxretry = 3
 bantime = 3600
 EOF
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+        systemctl restart fail2ban >/dev/null 2>&1 || true
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sпропущено (apt не сработал)%s\n' "$C_YLW" "$C_RST"
+    fi
 
     printf '  Настраиваю автообновления... '
-    apt install -y unattended-upgrades >/dev/null 2>&1
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+    if apt install -y unattended-upgrades >/dev/null 2>&1; then
+        cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
+        cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
 };
@@ -707,9 +721,12 @@ Unattended-Upgrade::Package-Blacklist {
     "docker.io";
 };
 EOF
-    systemctl enable unattended-upgrades >/dev/null 2>&1
-    systemctl restart unattended-upgrades >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
+        systemctl enable unattended-upgrades >/dev/null 2>&1 || true
+        systemctl restart unattended-upgrades >/dev/null 2>&1 || true
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sпропущено (apt не сработал)%s\n' "$C_YLW" "$C_RST"
+    fi
 
     printf '  Применяю sysctl-настройки... '
     cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
@@ -725,7 +742,7 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
-    sysctl --system >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '\n%s═══ Готово ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
