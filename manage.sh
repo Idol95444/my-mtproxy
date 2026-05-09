@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# pipefail умышленно НЕ включён: интерактивный TUI много работает с pipe'ами
+# где допустим non-zero exit одной из команд (grep без совпадений и т.п.)
+set -eu
 
 # ============================================================
 # manage.sh — установщик и менеджер MTProto-прокси
@@ -87,8 +89,9 @@ detect_compose() {
 }
 
 detect_ssh_port() {
-    local port
-    port=$(grep -iE "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
+    local port=""
+    # awk вместо grep — не падает при отсутствии совпадений (важно при set -e + pipefail)
+    port=$(awk '/^[Pp]ort / {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
     SSH_PORT="${port:-22}"
 }
 
@@ -192,9 +195,9 @@ check_dns_health() {
     fi
 
     # 4. Внешние DNS (Cloudflare и Google) — пропагация
-    local cf_ip google_ip
-    cf_ip=$(dig @1.1.1.1 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-    google_ip=$(dig @8.8.8.8 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+    local cf_ip="" google_ip=""
+    cf_ip=$(dig @1.1.1.1 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
+    google_ip=$(dig @8.8.8.8 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
 
     if [[ -z "$cf_ip" ]]; then
         printf '  %s⚠%s Cloudflare DNS (1.1.1.1) пока не видит домен — DNS не пропагировал\n' \
@@ -218,8 +221,8 @@ check_dns_health() {
     fi
 
     # 5. Порт 80 — критично для ACME-challenge и Caddy
-    local p80_user
-    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+    local p80_user=""
+    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p80_user" ]]; then
         # Если это наш же Caddy от прошлой попытки — это нормально
         if echo "$p80_user" | grep -qE '"caddy"|"docker-proxy"'; then
@@ -234,8 +237,8 @@ check_dns_health() {
     fi
 
     # 6. Порт 443 — критично для TLS-маскировки и LE TLS-ALPN-01
-    local p443_user
-    p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+    local p443_user=""
+    p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
         if echo "$p443_user" | grep -qE '"caddy"|"docker-proxy"'; then
             printf '  %s⚠%s Порт 443 занят Caddy (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p443_user"
@@ -629,8 +632,8 @@ action_security() {
     while IFS= read -r port; do
         [[ -z "$port" ]] && continue
         if ! is_whitelisted "$port"; then
-            local proc
-            proc=$(ss -tlnp 2>/dev/null | awk -v p=":$port " '$0 ~ p {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1)
+            local proc=""
+            proc=$(ss -tlnp 2>/dev/null | awk -v p=":$port " '$0 ~ p {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
             [[ -z "$proc" ]] && proc="(неизвестно)"
             printf '\n%sПорт %s%s слушается процессом:\n' "$C_YLW" "$port" "$C_RST"
             printf '  %s\n' "$proc"
