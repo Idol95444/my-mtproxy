@@ -31,6 +31,9 @@ fi
 COMPOSE=""
 SSH_PORT="22"
 
+# Домен для FakeTLS-маскировки (должен совпадать с TLS_DOMAIN в config.py.template)
+TLS_MASK_DOMAIN="www.google.com"
+
 # ============ HELPERS ============
 
 require_root() {
@@ -248,23 +251,7 @@ check_dns_health() {
         printf '  %s✓%s Google DNS видит: %s\n' "$C_GRN" "$C_RST" "$google_ip"
     fi
 
-    # 5. Порт 80 — критично для ACME-challenge и Caddy
-    local p80_user=""
-    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
-    if [[ -n "$p80_user" ]]; then
-        # Если это наш же nginx от прошлой попытки — это нормально
-        if echo "$p80_user" | grep -qE '"nginx"|"docker-proxy"'; then
-            printf '  %s⚠%s Порт 80 занят nginx (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p80_user"
-            warnings=$((warnings+1))
-        else
-            printf '  %s✗%s Порт 80 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p80_user"
-            errors=$((errors+1))
-        fi
-    else
-        printf '  %s✓%s Порт 80 свободен\n' "$C_GRN" "$C_RST"
-    fi
-
-    # 6. Порт 443 — для alexbers (MTProto). nginx будет на 8443.
+    # 5. Порт 443 — для alexbers (MTProto). Должен быть свободен.
     local p443_user=""
     p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
@@ -322,7 +309,6 @@ print_status() {
 
     local domain="${C_DIM}не установлен${C_RST}"
     local proxy_state="${C_DIM}не запущен${C_RST}"
-    local nginx_state="${C_DIM}не запущен${C_RST}"
     local ad_tag_state="${C_DIM}нет${C_RST}"
     local ufw_state="${C_DIM}не настроен${C_RST}"
 
@@ -340,11 +326,6 @@ print_status() {
         else
             proxy_state="${C_YLW}остановлен${C_RST}"
         fi
-        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-nginx"; then
-            nginx_state="${C_GRN}запущен${C_RST}"
-        else
-            nginx_state="${C_YLW}остановлен${C_RST}"
-        fi
     fi
 
     if command -v ufw >/dev/null 2>&1; then
@@ -358,8 +339,7 @@ print_status() {
     cat <<STATUS
 
   ${C_BLD}Домен:${C_RST}      ${domain}
-  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 443)${C_RST}
-  ${C_BLD}nginx:${C_RST}      ${nginx_state}    ${C_DIM}(порт 80, 8443)${C_RST}
+  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 443, маска: ${TLS_MASK_DOMAIN})${C_RST}
   ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
   ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
 
@@ -376,18 +356,17 @@ ${C_BLD}═══ УСТАНОВКА ═══${C_RST}
 ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
   ${C_CYN}4)${C_RST} Статус контейнеров
   ${C_CYN}5)${C_RST} Логи alexbers                ${C_DIM}(live, Ctrl+C — выход)${C_RST}
-  ${C_CYN}6)${C_RST} Логи nginx                   ${C_DIM}(live, Ctrl+C — выход)${C_RST}
-  ${C_CYN}7)${C_RST} Перезапустить прокси
-  ${C_CYN}8)${C_RST} Остановить всё
-  ${C_CYN}9)${C_RST} Запустить всё
-  ${C_CYN}10)${C_RST} Показать ссылку для пользователей
+  ${C_CYN}6)${C_RST} Перезапустить прокси
+  ${C_CYN}7)${C_RST} Остановить всё
+  ${C_CYN}8)${C_RST} Запустить всё
+  ${C_CYN}9)${C_RST} Показать ссылку для пользователей
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
-  ${C_CYN}11)${C_RST} Обновить систему              ${C_DIM}(apt update && upgrade)${C_RST}
-  ${C_CYN}12)${C_RST} Обновить скрипт из git
-  ${C_CYN}13)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
-  ${C_CYN}14)${C_RST} Удалить прокси
-  ${C_CYN}15)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/80/5222)${C_RST}
+  ${C_CYN}10)${C_RST} Обновить систему              ${C_DIM}(apt update && upgrade)${C_RST}
+  ${C_CYN}11)${C_RST} Обновить скрипт из git
+  ${C_CYN}12)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
+  ${C_CYN}13)${C_RST} Удалить прокси
+  ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/80/5222)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -569,39 +548,23 @@ EOF
 
     printf '  Генерирую config.py... '
     if [[ -n "$AD_TAG" ]]; then
-        sed -e "s/__DOMAIN__/$DOMAIN/g" \
-            -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
             -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
             config.py.template > config.py
     else
-        sed -e "s/__DOMAIN__/$DOMAIN/g" \
-            -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
             config.py.template > config.py
     fi
     chmod 644 config.py
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    printf '  Генерирую временный конфиг nginx (HTTP, для ACME)... '
-    # Если Docker ранее создал nginx.conf как директорию — удаляем
-    [[ -d nginx.conf ]] && rm -rf nginx.conf
-    cat > nginx.conf <<NGINXEOF
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-    location / {
-        return 200 'OK';
-        add_header Content-Type text/plain;
-        add_header Server nginx;
-    }
-}
-NGINXEOF
+    # Остановить возможные старые контейнеры (nginx, certbot от предыдущих версий)
+    printf '  Останавливаю старые контейнеры (если есть)... '
+    $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    printf '  Запускаю nginx (HTTP, для ACME-challenge)... '
-    $COMPOSE up -d nginx >/dev/null 2>&1
+    printf '  Запускаю alexbers... '
+    $COMPOSE up -d --build alexbers >/dev/null 2>&1
     local i=0
     while (( i < 10 )); do
         sleep 1
@@ -610,51 +573,16 @@ NGINXEOF
     done
     printf '\n'
 
-    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-nginx"; then
-        fail_inline "nginx не запустился — порт 80 занят другим процессом"
-        printf '%s   Проверь: ss -tlnp | grep -E '"'"':80|:443'"'"'%s\n' "$C_DIM" "$C_RST"
-        printf '%s   Останови конфликтующий сервис и повтори установку.%s\n' "$C_DIM" "$C_RST"
-        $COMPOSE down >/dev/null 2>&1 || true
+    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
+        fail_inline "alexbers не запустился"
+        printf '%s   Проверь логи: sudo proxy → 5) Логи alexbers%s\n' "$C_DIM" "$C_RST"
         pause; return
     fi
-    ok_inline "nginx запущен"
+    ok_inline "alexbers запущен"
 
-    printf '  Получаю LE-сертификат (certbot webroot)... '
-    if $COMPOSE run --rm \
-        --entrypoint certbot \
-        certbot certonly \
-            --webroot \
-            --webroot-path /var/www/certbot \
-            --non-interactive \
-            --agree-tos \
-            --email "" \
-            -d "$DOMAIN" >/dev/null 2>&1; then
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    else
-        fail_inline "Certbot не выпустил сертификат"
-        printf '%s   Проверь: DNS указывает на этот VPS, порт 80 доступен извне.%s\n' "$C_DIM" "$C_RST"
-        printf '%s   Подробности: docker logs mtproxy-certbot%s\n' "$C_DIM" "$C_RST"
-        $COMPOSE down >/dev/null 2>&1 || true
-        pause; return
-    fi
-
-    printf '  Включаю HTTPS в конфиге nginx... '
-    sed "s/__DOMAIN__/$DOMAIN/g" nginx.conf.template > nginx.conf
-    $COMPOSE exec nginx nginx -s reload >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    printf '  Запускаю alexbers... '
-    $COMPOSE up -d --build alexbers >/dev/null 2>&1
-    sleep 5
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    printf '  Запускаю certbot (автообновление)... '
-    $COMPOSE up -d certbot >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    local hex_domain link
-    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_domain}"
+    local hex_mask link
+    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
     printf '%sFakeTLS-ссылка:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
@@ -704,7 +632,7 @@ action_security() {
         unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
     fi
 
-    local whitelist=("$SSH_PORT" 80 443)
+    local whitelist=("$SSH_PORT" 443)
     is_whitelisted() {
         local p="$1"
         for wp in "${whitelist[@]}"; do
@@ -750,13 +678,12 @@ action_security() {
 
     printf '  Открываю порты: '
     ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
-    ufw allow 80/tcp comment "nginx HTTP" >/dev/null 2>&1 || true
-    ufw allow 443/tcp comment "nginx HTTPS / MTProto alexbers" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "MTProto alexbers" >/dev/null 2>&1 || true
     for port in "${extra_open[@]:-}"; do
         [[ -z "$port" ]] && continue
         ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
     done
-    printf '%s%s 80 443%s' "$C_CYN" "$SSH_PORT" "$C_RST"
+    printf '%s%s 443%s' "$C_CYN" "$SSH_PORT" "$C_RST"
     if [[ ${#extra_open[@]} -gt 0 ]]; then
         printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
     fi
@@ -865,21 +792,6 @@ action_logs_alexbers() {
     pause
 }
 
-action_logs_nginx() {
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        print_header
-        fail_inline "Docker не установлен"
-        pause; return
-    fi
-    print_header
-    printf '%s═══ Логи nginx (live, Ctrl+C — выход) ═══%s\n\n' "$C_BLD" "$C_RST"
-    trap 'true' INT
-    $COMPOSE logs --tail 30 -f nginx || true
-    trap - INT
-    pause
-}
-
 action_restart() {
     print_header
     printf '%s═══ Перезапуск ═══%s\n\n' "$C_BLD" "$C_RST"
@@ -939,12 +851,12 @@ action_show_link() {
         pause; return
     fi
 
-    local hex_domain link
-    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_domain}"
+    local hex_mask link
+    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
 
     printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
-    printf '%sРаздавай только эту, FakeTLS-форму (она с префиксом ee).%s\n' "$C_DIM" "$C_RST"
+    printf '%sФормат: ee (FakeTLS) + секрет + маска-домен (%s).%s\n' "$C_DIM" "$TLS_MASK_DOMAIN" "$C_RST"
     pause
 }
 
@@ -1093,7 +1005,7 @@ action_self_update() {
     printf '\n%sИзменённые файлы:%s\n' "$C_BLD" "$C_RST"
     printf '%s\n' "$changed" | sed 's/^/  /'
 
-    if printf '%s' "$changed" | grep -qE '^(docker-compose\.yml|Caddyfile\.template|nginx\.conf\.template|config\.py\.template)$'; then
+    if printf '%s' "$changed" | grep -qE '^(docker-compose\.yml|config\.py\.template)$'; then
         printf '\n%sИзменились шаблоны или compose.%s\n' "$C_YLW" "$C_RST"
         if confirm "Перегенерировать конфиги и перезапустить контейнеры?" N; then
             detect_compose
@@ -1104,84 +1016,29 @@ action_self_update() {
 
                 # Обновляем config.py
                 if [[ -n "${AD_TAG:-}" ]]; then
-                    sed -e "s/__DOMAIN__/$DOMAIN/g" \
-                        -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                    sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
                         -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
                         config.py.template > config.py
                 else
-                    sed -e "s/__DOMAIN__/$DOMAIN/g" \
-                        -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                    sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
                         config.py.template > config.py
                 fi
                 chmod 644 config.py
 
-                # Если nginx.conf ещё не существует — миграция с Caddy или первый деплой
-                if [[ ! -f nginx.conf ]]; then
-                    printf '%s  Миграция Caddy → nginx: нужно получить новый LE-сертификат%s\n' "$C_YLW" "$C_RST"
-                    printf '  Останавливаю старые контейнеры... '
-                    $COMPOSE down >/dev/null 2>&1 || true
-                    rm -f Caddyfile
-                    printf '%sok%s\n' "$C_GRN" "$C_RST"
+                # Останавливаем всё (включая nginx/certbot от старых версий)
+                printf '  Останавливаю старые контейнеры... '
+                $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
+                rm -f nginx.conf Caddyfile
+                printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-                    printf '  Генерирую временный конфиг nginx (HTTP)... '
-                    [[ -d nginx.conf ]] && rm -rf nginx.conf
-                    cat > nginx.conf <<NGINXEOF
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-    location / {
-        return 200 'OK';
-        add_header Content-Type text/plain;
-        add_header Server nginx;
-    }
-}
-NGINXEOF
-                    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-                    printf '  Запускаю nginx (HTTP)... '
-                    $COMPOSE up -d nginx >/dev/null 2>&1
-                    sleep 10
-                    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-nginx"; then
-                        fail_inline "nginx не запустился — порт 80 занят"
-                        pause; return
-                    fi
-                    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-                    printf '  Получаю LE-сертификат (certbot)... '
-                    if $COMPOSE run --rm \
-                        --entrypoint certbot \
-                        certbot certonly \
-                            --webroot \
-                            --webroot-path /var/www/certbot \
-                            --non-interactive \
-                            --agree-tos \
-                            --email "" \
-                            -d "$DOMAIN" >/dev/null 2>&1; then
-                        printf '%sok%s\n' "$C_GRN" "$C_RST"
-                    else
-                        fail_inline "Certbot не выпустил сертификат"
-                        printf '%s  Проверь: DNS указывает на этот VPS, порт 80 доступен извне.%s\n' "$C_DIM" "$C_RST"
-                        $COMPOSE down >/dev/null 2>&1 || true
-                        pause; return
-                    fi
-
-                    printf '  Включаю HTTPS конфиг nginx... '
-                    sed "s/__DOMAIN__/$DOMAIN/g" nginx.conf.template > nginx.conf
-                    $COMPOSE exec nginx nginx -s reload >/dev/null 2>&1
-                    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-                    printf '  Запускаю alexbers и certbot... '
-                    $COMPOSE up -d --build alexbers certbot >/dev/null 2>&1
-                    printf '%sok%s\n' "$C_GRN" "$C_RST"
+                printf '  Запускаю alexbers... '
+                $COMPOSE up -d --build alexbers >/dev/null 2>&1
+                sleep 8
+                if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
+                    ok_inline "alexbers запущен"
                 else
-                    # nginx.conf уже есть — просто обновляем шаблон и перезапускаем
-                    sed "s/__DOMAIN__/$DOMAIN/g" nginx.conf.template > nginx.conf
-                    $COMPOSE up -d --build >/dev/null 2>&1
+                    fail_inline "alexbers не запустился — проверь логи (пункт 5)"
                 fi
-                ok_inline "Контейнеры перезапущены"
             fi
         fi
     fi
@@ -1205,11 +1062,10 @@ action_uninstall() {
     printf '%sDocker НЕ удаляется — он может использоваться другими сервисами.%s\n\n' "$C_DIM" "$C_RST"
 
     printf '%sЭтап 1 — Прокси (обязательно):%s\n' "$C_BLD" "$C_RST"
-    printf '  • остановить контейнеры (mtproxy-nginx, mtproxy-certbot, mtproto-final)\n'
-    printf '  • удалить Docker volumes (certbot_certs — LE-сертификат, certbot_www)\n'
+    printf '  • остановить контейнеры (mtproto-final и возможные старые nginx/certbot)\n'
     printf '  • удалить Docker-образы собранные нами (alexbers)\n'
     printf '  • удалить Docker network проекта\n'
-    printf '  • удалить nginx.conf, config.py, .env\n'
+    printf '  • удалить config.py, .env\n'
     printf '  • удалить папку src/ (исходник alexbers)\n\n'
 
     if ! confirm "Удалить прокси?" Y; then
@@ -1241,9 +1097,8 @@ action_uninstall() {
     # === ЭТАП 1: Контейнеры, образы, volumes, конфиги ===
     detect_compose
     if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
-        printf '  Останавливаю контейнеры, удаляю volumes и образы... '
-        # -v убирает volumes (caddy_data!), --rmi local удаляет локально собранные образы
-        $COMPOSE down -v --rmi local --remove-orphans >/dev/null 2>&1 || true
+        printf '  Останавливаю контейнеры, удаляю образы... '
+        $COMPOSE down --rmi local --remove-orphans >/dev/null 2>&1 || true
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
 
@@ -1257,15 +1112,16 @@ action_uninstall() {
             -q 2>/dev/null)
         if [[ -n "$stale" ]]; then
             printf '  Удаляю осиротевшие контейнеры... '
+            # shellcheck disable=SC2086
             docker rm -f $stale >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
         fi
 
-        # Удаляем volumes по имени (на случай если down -v не сработал)
+        # Удаляем возможные старые volumes от nginx/certbot
         local vols
         vols=$(docker volume ls -q 2>/dev/null | grep -E '(my-mtproxy|mtproxy)_(certbot_certs|certbot_www|caddy_data|caddy_config)' || true)
         if [[ -n "$vols" ]]; then
-            printf '  Удаляю volumes... '
+            printf '  Удаляю старые volumes (certbot/caddy)... '
             echo "$vols" | xargs -r docker volume rm >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
         fi
@@ -1406,16 +1262,15 @@ main() {
             3)  action_security ;;
             4)  action_status ;;
             5)  action_logs_alexbers ;;
-            6)  action_logs_nginx ;;
-            7)  action_restart ;;
-            8)  action_stop ;;
-            9)  action_start ;;
-            10) action_show_link ;;
-            11) action_system_update ;;
-            12) action_self_update ;;
-            13) action_install_shortcut ;;
-            14) action_uninstall ;;
-            15) action_check_telegram ;;
+            6)  action_restart ;;
+            7)  action_stop ;;
+            8)  action_start ;;
+            9)  action_show_link ;;
+            10) action_system_update ;;
+            11) action_self_update ;;
+            12) action_install_shortcut ;;
+            13) action_uninstall ;;
+            14) action_check_telegram ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac

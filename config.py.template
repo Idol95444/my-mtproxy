@@ -4,8 +4,8 @@ USERS = {
     "user1": "__BASE_SECRET__",
 }
 
-TLS_DOMAIN = "__DOMAIN__"
-MASK_PORT = 8443
+# Популярный домен для FakeTLS-маскировки (alexbers сам заберёт cert с него)
+TLS_DOMAIN = "www.google.com"
 
 # Uncomment after registering proxy in @MTProxybot (/newproxy)
 # AD_TAG = "__AD_TAG__"
