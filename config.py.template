@@ -4,8 +4,8 @@ USERS = {
     "user1": "__BASE_SECRET__",
 }
 
-# Популярный домен для FakeTLS-маскировки (alexbers сам заберёт cert с него)
-TLS_DOMAIN = "www.google.com"
+# Домен для FakeTLS-маскировки (определяется автоматически при деплое)
+TLS_DOMAIN = "__TLS_DOMAIN__"
 
 # Только FakeTLS — минимум детектируемости
 MODES = {"classic": False, "secure": False, "tls": True}

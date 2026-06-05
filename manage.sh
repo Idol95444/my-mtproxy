@@ -31,7 +31,9 @@ fi
 COMPOSE=""
 SSH_PORT="22"
 
-# Домен для FakeTLS-маскировки (должен совпадать с TLS_DOMAIN в config.py.template)
+# Кандидаты FakeTLS-домена (тестируются при деплое, первый доступный побеждает)
+TLS_DOMAIN_CANDIDATES=("www.google.com" "www.cloudflare.com" "www.apple.com" "www.bing.com")
+# Активный домен: загружается из .env после деплоя
 TLS_MASK_DOMAIN="www.google.com"
 
 # ============ HELPERS ============
@@ -167,6 +169,25 @@ fail_inline() {
 
 step() {
     printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"
+}
+
+# Определяет первый доступный TLS-домен из списка кандидатов.
+# Устанавливает TLS_MASK_DOMAIN и возвращает 0 при успехе, 1 если ни один недоступен.
+detect_tls_domain() {
+    local quiet="${1:-noisy}"
+    for candidate in "${TLS_DOMAIN_CANDIDATES[@]}"; do
+        if [[ "$quiet" == "noisy" ]]; then
+            printf '    Пробую %s... ' "$candidate"
+        fi
+        if timeout 5 bash -c "echo >/dev/tcp/${candidate}/443" 2>/dev/null; then
+            TLS_MASK_DOMAIN="$candidate"
+            [[ "$quiet" == "noisy" ]] && printf '%sдоступен%s\n' "$C_GRN" "$C_RST"
+            return 0
+        else
+            [[ "$quiet" == "noisy" ]] && printf '%sнедоступен%s\n' "$C_DIM" "$C_RST"
+        fi
+    done
+    return 1
 }
 
 # Проверка домена: правильный ли IP, пропагировал ли DNS, свободен ли порт 80
@@ -315,11 +336,12 @@ print_status() {
     local ufw_state="${C_DIM}не настроен${C_RST}"
 
     if [[ -f .env ]]; then
-        local DOMAIN="" AD_TAG=""
+        local DOMAIN="" AD_TAG="" TLS_DOMAIN=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
         [[ -n "${DOMAIN:-}" ]] && domain="$DOMAIN"
         [[ -n "${AD_TAG:-}" ]] && ad_tag_state="${C_GRN}настроен${C_RST}"
+        [[ -n "${TLS_DOMAIN:-}" ]] && TLS_MASK_DOMAIN="$TLS_DOMAIN"
     fi
 
     if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
@@ -501,11 +523,22 @@ action_deploy() {
         return
     fi
 
+    # Определяем TLS-домен для FakeTLS-маскировки
+    printf '\n  Ищу доступный TLS-домен для FakeTLS-маскировки...\n'
+    if ! detect_tls_domain noisy; then
+        fail_inline "Ни один TLS-домен не доступен с этого VPS"
+        printf '%s  Возможно, VPS блокирует исходящий HTTPS.%s\n' "$C_DIM" "$C_RST"
+        printf '%s  Проверь вручную: timeout 5 bash -c "echo >/dev/tcp/www.google.com/443" && echo OK%s\n' "$C_DIM" "$C_RST"
+        pause; return
+    fi
+    ok_inline "TLS-домен: ${TLS_MASK_DOMAIN}"
+
     # Сохраняем .env
     cat > .env <<EOF
 DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
 AD_TAG=${AD_TAG:-}
+TLS_DOMAIN=$TLS_MASK_DOMAIN
 EOF
     chmod 600 .env
 
@@ -548,10 +581,12 @@ EOF
     printf '  Генерирую config.py... '
     if [[ -n "$AD_TAG" ]]; then
         sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
             -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
             config.py.template > config.py
     else
         sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
             config.py.template > config.py
     fi
     chmod 644 config.py
@@ -841,7 +876,7 @@ action_show_link() {
         pause; return
     fi
 
-    local DOMAIN="" BASE_SECRET=""
+    local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
     # shellcheck source=/dev/null
     source .env
 
@@ -849,13 +884,14 @@ action_show_link() {
         fail_inline "В .env нет DOMAIN или BASE_SECRET"
         pause; return
     fi
+    local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
 
     local hex_mask link
-    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
+    hex_mask=$(echo -n "$mask" | xxd -ps | tr -d '\n')
     link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
 
     printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
-    printf '%sФормат: ee (FakeTLS) + секрет + маска-домен (%s).%s\n' "$C_DIM" "$TLS_MASK_DOMAIN" "$C_RST"
+    printf '%sФормат: ee (FakeTLS) + секрет + маска-домен (%s).%s\n' "$C_DIM" "$mask" "$C_RST"
     pause
 }
 
@@ -1009,17 +1045,29 @@ action_self_update() {
         if confirm "Перегенерировать конфиги и перезапустить контейнеры?" N; then
             detect_compose
             if [[ -n "$COMPOSE" && -f .env ]]; then
-                local DOMAIN="" BASE_SECRET="" AD_TAG=""
+                local DOMAIN="" BASE_SECRET="" AD_TAG="" TLS_DOMAIN=""
                 # shellcheck source=/dev/null
                 source .env
+                local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
+
+                # Если TLS_DOMAIN не сохранён в .env — проверяем доступность
+                if [[ -z "${TLS_DOMAIN:-}" ]]; then
+                    printf '  Ищу доступный TLS-домен...\n'
+                    detect_tls_domain noisy || true
+                    mask="$TLS_MASK_DOMAIN"
+                    # Сохраняем в .env
+                    printf '\nTLS_DOMAIN=%s\n' "$mask" >> .env
+                fi
 
                 # Обновляем config.py
                 if [[ -n "${AD_TAG:-}" ]]; then
                     sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                        -e "s/__TLS_DOMAIN__/$mask/g" \
                         -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
                         config.py.template > config.py
                 else
                     sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                        -e "s/__TLS_DOMAIN__/$mask/g" \
                         config.py.template > config.py
                 fi
                 chmod 644 config.py
@@ -1201,6 +1249,25 @@ action_uninstall() {
 action_check_telegram() {
     print_header
     printf '%s═══ Проверка связи с Telegram ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    # Читаем TLS_DOMAIN из .env если есть
+    if [[ -f .env ]]; then
+        local TLS_DOMAIN=""
+        # shellcheck source=/dev/null
+        source .env 2>/dev/null || true
+        [[ -n "${TLS_DOMAIN:-}" ]] && TLS_MASK_DOMAIN="$TLS_DOMAIN"
+    fi
+
+    # Проверяем TLS-маскировочный домен
+    printf '%sFakeTLS-маскировка (TLS_DOMAIN = %s):%s\n' "$C_BLD" "$TLS_MASK_DOMAIN" "$C_RST"
+    if timeout 5 bash -c "echo >/dev/tcp/${TLS_MASK_DOMAIN}/443" 2>/dev/null; then
+        printf '  %s✓ %s:443 доступен — FakeTLS будет работать%s\n\n' "$C_GRN" "$TLS_MASK_DOMAIN" "$C_RST"
+    else
+        printf '  %s✗ %s:443 НЕДОСТУПЕН — FakeTLS не будет работать!%s\n' "$C_RED" "$TLS_MASK_DOMAIN" "$C_RST"
+        printf '  %sAlexbers не сможет получить TLS-cert → клиенты не подключатся.%s\n' "$C_DIM" "$C_RST"
+        printf '  %sПроверь альтернативы или обратись к хостеру.%s\n\n' "$C_DIM" "$C_RST"
+    fi
+
     printf 'Проверяю TCP-доступность датацентров Telegram с этого сервера...\n\n'
 
     local -a dc_list=("DC1:149.154.175.50" "DC2:149.154.167.51" "DC3:149.154.175.100" "DC4:149.154.167.91" "DC5:149.154.171.5")
