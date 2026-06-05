@@ -360,14 +360,20 @@ print_status() {
         fi
     fi
 
+    local tls_warning=""
+    if [[ -f config.py ]] && grep -q '__TLS_DOMAIN__' config.py 2>/dev/null; then
+        tls_warning="\n  ${C_RED}⚠ TLS-домен не настроен — прокси плохо замаскирован. Запусти пункт 15.${C_RST}"
+    fi
+
     cat <<STATUS
 
   ${C_BLD}Домен:${C_RST}      ${domain}
   ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 443, маска: ${TLS_MASK_DOMAIN})${C_RST}
   ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
   ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
-
 STATUS
+    [[ -n "$tls_warning" ]] && printf "${tls_warning}\n"
+    printf '\n'
 }
 
 print_menu() {
@@ -391,6 +397,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}12)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
   ${C_CYN}13)${C_RST} Удалить прокси
   ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/80/5222)${C_RST}
+  ${C_CYN}15)${C_RST} Исправить TLS-домен           ${C_DIM}(если прокси работает только через VPN)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -1244,6 +1251,93 @@ action_uninstall() {
     pause
 }
 
+# ============ ACTIONS: FIX TLS DOMAIN ============
+
+action_fix_tls_domain() {
+    print_header
+    printf '%s═══ Исправить TLS-домен ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%sЭта операция обновляет TLS-маску в config.py и перезапускает прокси.%s\n' "$C_DIM" "$C_RST"
+    printf '%sПомогает когда прокси работает только через VPN.%s\n\n' "$C_DIM" "$C_RST"
+
+    if [[ ! -f .env ]]; then
+        fail_inline ".env не найден. Сначала установи прокси (пункт 2)."
+        pause; return
+    fi
+
+    local DOMAIN="" BASE_SECRET="" AD_TAG="" TLS_DOMAIN=""
+    # shellcheck source=/dev/null
+    source .env 2>/dev/null || true
+
+    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" ]]; then
+        fail_inline "В .env нет DOMAIN или BASE_SECRET — нужна полная переустановка (пункт 2)"
+        pause; return
+    fi
+
+    printf 'Текущий TLS_DOMAIN: %s%s%s\n\n' "$C_YLW" "${TLS_DOMAIN:-(не задан)}" "$C_RST"
+
+    printf 'Ищу доступный TLS-домен для FakeTLS-маскировки...\n'
+    if ! detect_tls_domain noisy; then
+        fail_inline "Ни один TLS-домен не доступен с этого VPS"
+        printf '%s  Возможно, VPS блокирует исходящий HTTPS.%s\n' "$C_DIM" "$C_RST"
+        pause; return
+    fi
+    ok_inline "Выбран: ${TLS_MASK_DOMAIN}"
+    printf '\n'
+
+    # Обновляем TLS_DOMAIN в .env
+    if grep -q '^TLS_DOMAIN=' .env; then
+        sed -i "s|^TLS_DOMAIN=.*|TLS_DOMAIN=${TLS_MASK_DOMAIN}|" .env
+    else
+        printf 'TLS_DOMAIN=%s\n' "$TLS_MASK_DOMAIN" >> .env
+    fi
+
+    # Перегенерируем config.py
+    printf '  Обновляю config.py... '
+    if [[ -n "${AD_TAG:-}" ]]; then
+        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+            -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
+            config.py.template > config.py
+    else
+        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+            config.py.template > config.py
+    fi
+    chmod 644 config.py
+
+    # Проверяем что плейсхолдеры заменены
+    if grep -qE '__TLS_DOMAIN__|__BASE_SECRET__' config.py 2>/dev/null; then
+        fail_inline "В config.py остались незаменённые плейсхолдеры — что-то пошло не так"
+        pause; return
+    fi
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # Перезапускаем прокси
+    detect_compose
+    if [[ -n "$COMPOSE" ]] && $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
+        printf '  Перезапускаю alexbers... '
+        $COMPOSE restart alexbers >/dev/null 2>&1
+        sleep 3
+        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
+        else
+            fail_inline "alexbers не запустился — проверь логи (пункт 5)"
+            pause; return
+        fi
+    else
+        printf '  %s(прокси не запущен, config.py обновлён — запусти вручную: пункт 8)%s\n' "$C_DIM" "$C_RST"
+    fi
+
+    local hex_mask link
+    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
+
+    printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
+    printf '%sАктуальная ссылка:%s\n%s\n' "$C_BLD" "$C_RST" "$link"
+
+    pause
+}
+
 # ============ ACTIONS: TELEGRAM CHECK ============
 
 action_check_telegram() {
@@ -1353,6 +1447,7 @@ main() {
             12) action_install_shortcut ;;
             13) action_uninstall ;;
             14) action_check_telegram ;;
+            15) action_fix_tls_domain ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
