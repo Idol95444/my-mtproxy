@@ -582,6 +582,8 @@ EOF
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Генерирую временный конфиг nginx (HTTP, для ACME)... '
+    # Если Docker ранее создал nginx.conf как директорию — удаляем
+    [[ -d nginx.conf ]] && rm -rf nginx.conf
     cat > nginx.conf <<NGINXEOF
 server {
     listen 80;
@@ -619,6 +621,7 @@ NGINXEOF
 
     printf '  Получаю LE-сертификат (certbot webroot)... '
     if $COMPOSE run --rm \
+        --entrypoint certbot \
         certbot certonly \
             --webroot \
             --webroot-path /var/www/certbot \
@@ -1122,6 +1125,7 @@ action_self_update() {
                     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
                     printf '  Генерирую временный конфиг nginx (HTTP)... '
+                    [[ -d nginx.conf ]] && rm -rf nginx.conf
                     cat > nginx.conf <<NGINXEOF
 server {
     listen 80;
@@ -1149,6 +1153,7 @@ NGINXEOF
 
                     printf '  Получаю LE-сертификат (certbot)... '
                     if $COMPOSE run --rm \
+                        --entrypoint certbot \
                         certbot certonly \
                             --webroot \
                             --webroot-path /var/www/certbot \

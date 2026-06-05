@@ -16,10 +16,7 @@ services:
     volumes:
       - certbot_www:/var/www/certbot
       - certbot_certs:/etc/letsencrypt
-    command: >
-      /bin/sh -c 'trap exit TERM; while :;
-        do certbot renew --webroot --webroot-path /var/www/certbot --quiet 2>&1;
-        sleep 12h & wait $${!}; done;'
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot --webroot-path /var/www/certbot --quiet 2>&1; sleep 12h & wait $${!}; done;'"
 
   alexbers:
     build: ./src
