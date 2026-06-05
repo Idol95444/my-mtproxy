@@ -14,7 +14,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
+    listen 8443 ssl;
     server_name __DOMAIN__;
 
     ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;

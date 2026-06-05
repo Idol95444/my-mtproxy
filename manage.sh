@@ -264,15 +264,14 @@ check_dns_health() {
         printf '  %s✓%s Порт 80 свободен\n' "$C_GRN" "$C_RST"
     fi
 
-    # 6. Порт 443 — критично для TLS-маскировки и LE TLS-ALPN-01
+    # 6. Порт 443 — для alexbers (MTProto). nginx будет на 8443.
     local p443_user=""
     p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
-        if echo "$p443_user" | grep -qE '"nginx"|"docker-proxy"'; then
-            printf '  %s⚠%s Порт 443 занят nginx (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p443_user"
+        if echo "$p443_user" | grep -qE '"nginx"|"docker-proxy"|"mtproto"'; then
+            printf '  %s⚠%s Порт 443 занят нашим контейнером (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p443_user"
             warnings=$((warnings+1))
         else
-            # Распознаём типичные конфликты
             local hint=""
             if echo "$p443_user" | grep -qE '"rw-core"|"remnawave"'; then
                 hint="Remnawave — у тебя на этом VPS уже стоит узел Remnawave."
@@ -285,7 +284,7 @@ check_dns_health() {
             fi
             printf '  %s✗%s Порт 443 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p443_user"
             [[ -n "$hint" ]] && printf '      %s%s%s\n' "$C_YLW" "$hint" "$C_RST"
-            printf '      %snginx не сможет занять 443 → cert не выпустится.%s\n' "$C_DIM" "$C_RST"
+            printf '      %sAlexbers не сможет занять 443 → прокси не запустится.%s\n' "$C_DIM" "$C_RST"
             errors=$((errors+1))
         fi
     else
@@ -359,8 +358,8 @@ print_status() {
     cat <<STATUS
 
   ${C_BLD}Домен:${C_RST}      ${domain}
-  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 853)${C_RST}
-  ${C_BLD}nginx:${C_RST}      ${nginx_state}    ${C_DIM}(порт 80, 443)${C_RST}
+  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 443)${C_RST}
+  ${C_BLD}nginx:${C_RST}      ${nginx_state}    ${C_DIM}(порт 80, 8443)${C_RST}
   ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
   ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
 
@@ -388,6 +387,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}12)${C_RST} Обновить скрипт из git
   ${C_CYN}13)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
   ${C_CYN}14)${C_RST} Удалить прокси
+  ${C_CYN}15)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/80/5222)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -654,14 +654,14 @@ NGINXEOF
 
     local hex_domain link
     hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=853&secret=ee${BASE_SECRET}${hex_domain}"
+    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_domain}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
     printf '%sFakeTLS-ссылка:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
 
     printf '%sЧто осталось вручную:%s\n' "$C_BLD" "$C_RST"
     printf '  1. @MTProxybot → /newproxy\n'
-    printf '  2. Введи: %s:853\n' "$DOMAIN"
+    printf '  2. Введи: %s:443\n' "$DOMAIN"
     printf '  3. Введи секрет: %s\n' "$BASE_SECRET"
     printf '  4. Сохрани AD_TAG из ответа бота\n'
     printf '  5. /myproxies → выбери прокси → Set promoted channel → @канал\n'
@@ -704,7 +704,7 @@ action_security() {
         unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
     fi
 
-    local whitelist=("$SSH_PORT" 80 443 853)
+    local whitelist=("$SSH_PORT" 80 443)
     is_whitelisted() {
         local p="$1"
         for wp in "${whitelist[@]}"; do
@@ -751,13 +751,12 @@ action_security() {
     printf '  Открываю порты: '
     ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
     ufw allow 80/tcp comment "nginx HTTP" >/dev/null 2>&1 || true
-    ufw allow 443/tcp comment "nginx HTTPS" >/dev/null 2>&1 || true
-    ufw allow 853/tcp comment "MTProto" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "nginx HTTPS / MTProto alexbers" >/dev/null 2>&1 || true
     for port in "${extra_open[@]:-}"; do
         [[ -z "$port" ]] && continue
         ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
     done
-    printf '%s%s 80 443 853%s' "$C_CYN" "$SSH_PORT" "$C_RST"
+    printf '%s%s 80 443%s' "$C_CYN" "$SSH_PORT" "$C_RST"
     if [[ ${#extra_open[@]} -gt 0 ]]; then
         printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
     fi
@@ -942,7 +941,7 @@ action_show_link() {
 
     local hex_domain link
     hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=853&secret=ee${BASE_SECRET}${hex_domain}"
+    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_domain}"
 
     printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
     printf '%sРаздавай только эту, FakeTLS-форму (она с префиксом ee).%s\n' "$C_DIM" "$C_RST"
@@ -1342,6 +1341,51 @@ action_uninstall() {
     pause
 }
 
+# ============ ACTIONS: TELEGRAM CHECK ============
+
+action_check_telegram() {
+    print_header
+    printf '%s═══ Проверка связи с Telegram ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf 'Проверяю TCP-доступность датацентров Telegram с этого сервера...\n\n'
+
+    local -a dc_list=("DC1:149.154.175.50" "DC2:149.154.167.51" "DC3:149.154.175.100" "DC4:149.154.167.91" "DC5:149.154.171.5")
+    local -a ports=(443 80 5222)
+    local ok_count=0 fail_count=0
+
+    for entry in "${dc_list[@]}"; do
+        local dc="${entry%%:*}"
+        local ip="${entry##*:}"
+        printf '  %s%-5s%s %s%-20s%s' "$C_BLD" "$dc" "$C_RST" "$C_DIM" "(${ip})" "$C_RST"
+        local dc_ok=false
+        for port in "${ports[@]}"; do
+            if timeout 5 bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null; then
+                printf '  %s%d ✓%s' "$C_GRN" "$port" "$C_RST"
+                dc_ok=true
+            else
+                printf '  %s%d ✗%s' "$C_DIM" "$port" "$C_RST"
+            fi
+        done
+        printf '\n'
+        if $dc_ok; then
+            ok_count=$((ok_count+1))
+        else
+            fail_count=$((fail_count+1))
+        fi
+    done
+
+    printf '\n'
+    if (( fail_count == 0 )); then
+        printf '%s✓ Все датацентры Telegram доступны — прокси может подключаться%s\n' "$C_GRN" "$C_RST"
+    elif (( ok_count == 0 )); then
+        printf '%s✗ Ни один датацентр Telegram недоступен%s\n' "$C_RED" "$C_RST"
+        printf '%s  Возможно, сервер заблокирован Telegram или нет интернета.%s\n' "$C_DIM" "$C_RST"
+    else
+        printf '%s⚠ Часть датацентров недоступна (%d/%d)%s\n' "$C_YLW" "$ok_count" "$((ok_count+fail_count))" "$C_RST"
+    fi
+
+    pause
+}
+
 # ============ MAIN ============
 
 main() {
@@ -1371,6 +1415,7 @@ main() {
             12) action_self_update ;;
             13) action_install_shortcut ;;
             14) action_uninstall ;;
+            15) action_check_telegram ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
