@@ -1204,20 +1204,25 @@ action_check_telegram() {
     printf 'Проверяю TCP-доступность датацентров Telegram с этого сервера...\n\n'
 
     local -a dc_list=("DC1:149.154.175.50" "DC2:149.154.167.51" "DC3:149.154.175.100" "DC4:149.154.167.91" "DC5:149.154.171.5")
-    local -a ports=(443 80 5222)
-    local ok_count=0 fail_count=0
+    local -a ports=(443 8888)
+    local ok_count=0 fail_count=0 middle_fail=0
+
+    printf '  %s%-5s  %-20s  %s443%s  %s8888%s\n' \
+        "$C_BLD" "DC" "(IP)" "$C_GRN" "$C_RST" "$C_CYN" "$C_RST"
+    printf '  %s─────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
 
     for entry in "${dc_list[@]}"; do
         local dc="${entry%%:*}"
         local ip="${entry##*:}"
-        printf '  %s%-5s%s %s%-20s%s' "$C_BLD" "$dc" "$C_RST" "$C_DIM" "(${ip})" "$C_RST"
+        printf '  %s%-5s%s %-20s' "$C_BLD" "$dc" "$C_RST" "(${ip})"
         local dc_ok=false
         for port in "${ports[@]}"; do
             if timeout 5 bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null; then
-                printf '  %s%d ✓%s' "$C_GRN" "$port" "$C_RST"
-                dc_ok=true
+                printf '  %s%-6s ✓%s' "$C_GRN" "$port" "$C_RST"
+                [[ "$port" == "443" ]] && dc_ok=true
             else
-                printf '  %s%d ✗%s' "$C_DIM" "$port" "$C_RST"
+                printf '  %s%-6s ✗%s' "$C_RED" "$port" "$C_RST"
+                [[ "$port" == "8888" ]] && middle_fail=$((middle_fail+1))
             fi
         done
         printf '\n'
@@ -1229,13 +1234,24 @@ action_check_telegram() {
     done
 
     printf '\n'
+
+    # Итог по порту 443 (основной)
     if (( fail_count == 0 )); then
-        printf '%s✓ Все датацентры Telegram доступны — прокси может подключаться%s\n' "$C_GRN" "$C_RST"
+        printf '%s✓ Все DC доступны по порту 443 — прямое подключение работает%s\n' "$C_GRN" "$C_RST"
     elif (( ok_count == 0 )); then
-        printf '%s✗ Ни один датацентр Telegram недоступен%s\n' "$C_RED" "$C_RST"
+        printf '%s✗ Ни один DC Telegram недоступен по порту 443%s\n' "$C_RED" "$C_RST"
         printf '%s  Возможно, сервер заблокирован Telegram или нет интернета.%s\n' "$C_DIM" "$C_RST"
     else
-        printf '%s⚠ Часть датацентров недоступна (%d/%d)%s\n' "$C_YLW" "$ok_count" "$((ok_count+fail_count))" "$C_RST"
+        printf '%s⚠ Часть DC недоступна по 443 (%d из 5)%s\n' "$C_YLW" "$ok_count" "$C_RST"
+    fi
+
+    # Итог по порту 8888 (middle proxy)
+    if (( middle_fail > 0 )); then
+        printf '\n%s⚠ Middle proxy (порт 8888): %d из 5 DC недоступны%s\n' "$C_YLW" "$middle_fail" "$C_RST"
+        printf '%s  USE_MIDDLE_PROXY=False в config.py правильное решение.%s\n' "$C_DIM" "$C_RST"
+        printf '%s  AD_TAG при этом зарегистрирован, но реклама показываться не будет.%s\n' "$C_DIM" "$C_RST"
+    else
+        printf '%s✓ Middle proxy (порт 8888): все DC доступны%s\n' "$C_GRN" "$C_RST"
     fi
 
     pause
