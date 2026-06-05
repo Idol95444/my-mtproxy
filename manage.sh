@@ -255,13 +255,15 @@ check_dns_health() {
     local p443_user=""
     p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
-        if echo "$p443_user" | grep -qE '"nginx"|"docker-proxy"|"mtproto"'; then
-            printf '  %s⚠%s Порт 443 занят нашим контейнером (от предыдущей попытки): %s\n' "$C_YLW" "$C_RST" "$p443_user"
+        # python3 / nginx / docker-proxy — это наши предыдущие контейнеры alexbers или nginx
+        if echo "$p443_user" | grep -qE '"nginx"|"docker-proxy"|"mtproto"|"python3"'; then
+            printf '  %s⚠%s Порт 443 занят предыдущим контейнером (будет остановлен): %s\n' "$C_YLW" "$C_RST" "$p443_user"
+            printf '      %sДеплой сам остановит его через docker compose down.%s\n' "$C_DIM" "$C_RST"
             warnings=$((warnings+1))
         else
             local hint=""
             if echo "$p443_user" | grep -qE '"rw-core"|"remnawave"'; then
-                hint="Remnawave — у тебя на этом VPS уже стоит узел Remnawave."
+                hint="Remnawave — архитектурный конфликт: оба хотят порт 443."
             elif echo "$p443_user" | grep -qE '"haproxy"'; then
                 hint="haproxy — отключи или убери его с 443."
             elif echo "$p443_user" | grep -qE '"xray"|"v2ray"|"singbox"|"sing-box"'; then
@@ -282,7 +284,7 @@ check_dns_health() {
     printf '\n'
     if (( errors > 0 )); then
         printf '  %sНайдено критичных ошибок: %d%s\n' "$C_RED" "$errors" "$C_RST"
-        printf '  %sLet'"'"'s Encrypt с такими настройками cert НЕ выпустит.%s\n' "$C_RED" "$C_RST"
+        printf '  %sПрокси не запустится с такими настройками.%s\n' "$C_RED" "$C_RST"
         return 1
     fi
     if (( warnings > 0 )); then
@@ -477,15 +479,12 @@ action_deploy() {
     # Развёрнутая проверка DNS, IP, портов
     if ! check_dns_health "$DOMAIN"; then
         printf '\n%sЧто делать:%s\n' "$C_BLD" "$C_RST"
-        printf '  • Если порт 80/443 занят %sRemnawave (rw-core)%s или другим прокси —\n' \
+        printf '  • Если порт 443 занят %sRemnawave (rw-core)%s или другим прокси —\n' \
             "$C_YLW" "$C_RST"
-        printf '    у тебя архитектурный конфликт. Варианты:\n'
+        printf '    архитектурный конфликт: оба хотят 443. Варианты:\n'
         printf '    1) Развернуть MTProto на отдельном VPS (рекомендую)\n'
-        printf '    2) Временно остановить конфликтующий сервис, получить cert,\n'
-        printf '       запустить его обратно — но nginx не сможет автообновить cert\n'
-        printf '       через 60 дней (придётся повторить вручную)\n'
-        printf '    3) Перенастроить Remnawave/прокси чтобы 443 уступал nginx\n'
-        printf '       (сложно, не покрывается этим скриптом)\n'
+        printf '    2) Временно остановить конфликтующий сервис для установки,\n'
+        printf '       затем запустить обратно (разберись вручную)\n'
         printf '  • Если несколько A-записей у домена — оставь только одну на этот VPS\n'
         printf '  • Если DNS не пропагировал — подожди 5-10 минут и повтори проверку\n\n'
         if ! confirm "Продолжить несмотря на ошибки? (НЕ рекомендую)" N; then
