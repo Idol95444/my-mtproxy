@@ -2,7 +2,7 @@
 
 !!! Скрипт разворачивай на голой VPSке
 
-Деплой MTProto-прокси с FakeTLS одной командой (Caddy + alexbers).
+Деплой MTProto-прокси с FakeTLS одной командой (nginx + certbot + alexbers).
 Меню в стиле control panel с живым статусом контейнеров и файрвола.
 
 ## Быстрый деплой
@@ -28,7 +28,7 @@ sudo proxy
 
   Домен:      proxy.example.com
   alexbers:   запущен    (порт 853)
-  Caddy:      запущен    (порт 80, 443)
+  nginx:      запущен    (порт 80, 443)
   AD_TAG:     настроен
   Файрвол:    активен
 
@@ -40,7 +40,7 @@ sudo proxy
 ═══ УПРАВЛЕНИЕ ═══
   4) Статус контейнеров
   5) Логи alexbers                (live, Ctrl+C — выход)
-  6) Логи Caddy                   (live, Ctrl+C — выход)
+  6) Логи nginx                   (live, Ctrl+C — выход)
   7) Перезапустить прокси
   8) Остановить всё
   9) Запустить всё
@@ -62,10 +62,11 @@ Wizard в 3 шага: домен → секрет (или авто-генера�
 
 1. Устанавливает Docker и docker-compose если нет
 2. Клонирует [alexbers/mtprotoproxy](https://github.com/alexbers/mtprotoproxy) (stable)
-3. Генерирует `Caddyfile` и `config.py` из шаблонов
-4. Запускает Caddy и ждёт LE-сертификат
-5. Запускает alexbers
-6. Печатает FakeTLS-ссылку и чек-лист оставшихся шагов в @MTProxybot
+3. Генерирует `nginx.conf` и `config.py` из шаблонов
+4. Запускает nginx (HTTP) и получает LE-сертификат через certbot
+5. Перезагружает nginx с HTTPS-конфигом
+6. Запускает alexbers
+7. Печатает FakeTLS-ссылку и чек-лист оставшихся шагов в @MTProxybot
 
 ## Что делает «Настроить безопасность VPS»
 
@@ -80,21 +81,29 @@ Wizard в 3 шага: домен → секрет (или авто-генера�
 ## Архитектура
 
 ```
-Интернет -> :80  -> Caddy (автопродление LE-сертификата, редирект HTTP→HTTPS)
-         -> :443 -> Caddy (TLS, страница-заглушка "OK", маскировка под nginx)
-         -> :853 -> alexbers (FakeTLS, забирает сертификат с Caddy при старте)
+Интернет -> :80  -> nginx (ACME-challenge, HTTP → 200 OK)
+         -> :443 -> nginx (TLS, страница-заглушка "OK", стандартный TLS-фрейминг)
+         -> :853 -> alexbers (FakeTLS, забирает сертификат с nginx:443 при старте)
 ```
+
+nginx обеспечивает **стандартный TLS-фрейминг** (в отличие от Caddy), что делает
+FakeTLS-трафик неотличимым от настоящего nginx для DPI/ТСПУ.
+
+Certbot автоматически перевыпускает LE-сертификат каждые 12 часов (проверка).
 
 ## Файлы
 
 | Файл | Назначение |
 |---|---|
 | `manage.sh` | Главный скрипт с TUI (чистый ANSI, без зависимостей) |
-| `Caddyfile.template` | Шаблон Caddy с плейсхолдером `__DOMAIN__` |
+| `nginx.conf.template` | Шаблон nginx с плейсхолдером `__DOMAIN__` |
 | `config.py.template` | Шаблон alexbers с плейсхолдерами |
-| `docker-compose.yml` | Два сервиса: caddy + alexbers |
+| `docker-compose.yml` | Три сервиса: nginx + certbot + alexbers |
 | `docs/V4.md` | Полная инструкция с диагностикой |
 
+## Безопасность репозитория
+
+**Никогда не коммить**: `config.py`, `.env`, `nginx.conf`, `src/` — всё в `.gitignore`.
 
 ## Полная инструкция
 

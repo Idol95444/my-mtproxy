@@ -1,4 +1,0 @@
-__DOMAIN__ {
-	respond "OK" 200
-	header Server "nginx"
-}
