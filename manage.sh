@@ -31,10 +31,7 @@ fi
 COMPOSE=""
 SSH_PORT="22"
 
-# Кандидаты FakeTLS-домена (тестируются при деплое, первый доступный побеждает)
-TLS_DOMAIN_CANDIDATES=("www.google.com" "www.cloudflare.com" "www.apple.com" "www.bing.com")
-# Активный домен: загружается из .env после деплоя
-TLS_MASK_DOMAIN="www.google.com"
+PROXY_PORT="853"
 
 # ============ HELPERS ============
 
@@ -171,24 +168,6 @@ step() {
     printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"
 }
 
-# Определяет первый доступный TLS-домен из списка кандидатов.
-# Устанавливает TLS_MASK_DOMAIN и возвращает 0 при успехе, 1 если ни один недоступен.
-detect_tls_domain() {
-    local quiet="${1:-noisy}"
-    for candidate in "${TLS_DOMAIN_CANDIDATES[@]}"; do
-        if [[ "$quiet" == "noisy" ]]; then
-            printf '    Пробую %s... ' "$candidate"
-        fi
-        if timeout 5 bash -c "echo >/dev/tcp/${candidate}/443" 2>/dev/null; then
-            TLS_MASK_DOMAIN="$candidate"
-            [[ "$quiet" == "noisy" ]] && printf '%sдоступен%s\n' "$C_GRN" "$C_RST"
-            return 0
-        else
-            [[ "$quiet" == "noisy" ]] && printf '%sнедоступен%s\n' "$C_DIM" "$C_RST"
-        fi
-    done
-    return 1
-}
 
 # Проверка домена: правильный ли IP, пропагировал ли DNS, свободен ли порт 80
 # Возвращает 0 если всё ОК, 1 если есть критичные ошибки.
@@ -272,12 +251,27 @@ check_dns_health() {
         printf '  %s✓%s Google DNS видит: %s\n' "$C_GRN" "$C_RST" "$google_ip"
     fi
 
-    # 5. Порт 443 — для alexbers (MTProto). Должен быть свободен.
+    # 5. Порт 80 — для ACME-challenge (Let's Encrypt через Caddy)
+    local p80_user=""
+    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
+    if [[ -n "$p80_user" ]]; then
+        if echo "$p80_user" | grep -qE '"caddy"|"docker-proxy"|"nginx"'; then
+            printf '  %s⚠%s Порт 80 занят предыдущим контейнером (будет остановлен): %s\n' "$C_YLW" "$C_RST" "$p80_user"
+            warnings=$((warnings+1))
+        else
+            printf '  %s✗%s Порт 80 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p80_user"
+            printf '      %sCaddy не сможет пройти ACME-challenge → LE-сертификат не выпустится.%s\n' "$C_DIM" "$C_RST"
+            errors=$((errors+1))
+        fi
+    else
+        printf '  %s✓%s Порт 80 свободен (ACME-challenge)\n' "$C_GRN" "$C_RST"
+    fi
+
+    # 6. Порт 443 — для Caddy (HTTPS/LE). Должен быть свободен или наш.
     local p443_user=""
     p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
-        # python3 / nginx / docker-proxy — это наши предыдущие контейнеры alexbers или nginx
-        if echo "$p443_user" | grep -qE '"nginx"|"docker-proxy"|"mtproto"|"python3"'; then
+        if echo "$p443_user" | grep -qE '"caddy"|"docker-proxy"|"nginx"|"python3"'; then
             printf '  %s⚠%s Порт 443 занят предыдущим контейнером (будет остановлен): %s\n' "$C_YLW" "$C_RST" "$p443_user"
             printf '      %sДеплой сам остановит его через docker compose down.%s\n' "$C_DIM" "$C_RST"
             warnings=$((warnings+1))
@@ -289,16 +283,14 @@ check_dns_health() {
                 hint="haproxy — отключи или убери его с 443."
             elif echo "$p443_user" | grep -qE '"xray"|"v2ray"|"singbox"|"sing-box"'; then
                 hint="Xray/V2Ray/sing-box — другой прокси уже использует 443."
-            elif echo "$p443_user" | grep -qE '"caddy"'; then
-                hint="Caddy — останови его: docker stop mtproxy-caddy"
             fi
             printf '  %s✗%s Порт 443 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p443_user"
             [[ -n "$hint" ]] && printf '      %s%s%s\n' "$C_YLW" "$hint" "$C_RST"
-            printf '      %sAlexbers не сможет занять 443 → прокси не запустится.%s\n' "$C_DIM" "$C_RST"
+            printf '      %sCaddy не сможет занять 443 → LE-сертификат не выпустится.%s\n' "$C_DIM" "$C_RST"
             errors=$((errors+1))
         fi
     else
-        printf '  %s✓%s Порт 443 свободен\n' "$C_GRN" "$C_RST"
+        printf '  %s✓%s Порт 443 свободен (Caddy)\n' "$C_GRN" "$C_RST"
     fi
 
     # Итог
@@ -335,13 +327,14 @@ print_status() {
     local ad_tag_state="${C_DIM}нет${C_RST}"
     local ufw_state="${C_DIM}не настроен${C_RST}"
 
+    local caddy_state="${C_DIM}не запущен${C_RST}"
+
     if [[ -f .env ]]; then
-        local DOMAIN="" AD_TAG="" TLS_DOMAIN=""
+        local DOMAIN="" AD_TAG=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
         [[ -n "${DOMAIN:-}" ]] && domain="$DOMAIN"
         [[ -n "${AD_TAG:-}" ]] && ad_tag_state="${C_GRN}настроен${C_RST}"
-        [[ -n "${TLS_DOMAIN:-}" ]] && TLS_MASK_DOMAIN="$TLS_DOMAIN"
     fi
 
     if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
@@ -349,6 +342,9 @@ print_status() {
             proxy_state="${C_GRN}запущен${C_RST}"
         else
             proxy_state="${C_YLW}остановлен${C_RST}"
+        fi
+        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-caddy"; then
+            caddy_state="${C_GRN}запущен${C_RST}"
         fi
     fi
 
@@ -360,19 +356,14 @@ print_status() {
         fi
     fi
 
-    local tls_warning=""
-    if [[ -f config.py ]] && grep -q '__TLS_DOMAIN__' config.py 2>/dev/null; then
-        tls_warning="\n  ${C_RED}⚠ TLS-домен не настроен — прокси плохо замаскирован. Запусти пункт 15.${C_RST}"
-    fi
-
     cat <<STATUS
 
   ${C_BLD}Домен:${C_RST}      ${domain}
-  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 443, маска: ${TLS_MASK_DOMAIN})${C_RST}
+  ${C_BLD}Caddy:${C_RST}      ${caddy_state}    ${C_DIM}(порт 80, 443 — LE-сертификат)${C_RST}
+  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 853 — FakeTLS-прокси)${C_RST}
   ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
   ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
 STATUS
-    [[ -n "$tls_warning" ]] && printf "${tls_warning}\n"
     printf '\n'
 }
 
@@ -396,8 +387,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}11)${C_RST} Обновить скрипт из git
   ${C_CYN}12)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
   ${C_CYN}13)${C_RST} Удалить прокси
-  ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/80/5222)${C_RST}
-  ${C_CYN}15)${C_RST} Исправить TLS-домен           ${C_DIM}(если прокси работает только через VPN)${C_RST}
+  ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/853/8888)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -530,22 +520,11 @@ action_deploy() {
         return
     fi
 
-    # Определяем TLS-домен для FakeTLS-маскировки
-    printf '\n  Ищу доступный TLS-домен для FakeTLS-маскировки...\n'
-    if ! detect_tls_domain noisy; then
-        fail_inline "Ни один TLS-домен не доступен с этого VPS"
-        printf '%s  Возможно, VPS блокирует исходящий HTTPS.%s\n' "$C_DIM" "$C_RST"
-        printf '%s  Проверь вручную: timeout 5 bash -c "echo >/dev/tcp/www.google.com/443" && echo OK%s\n' "$C_DIM" "$C_RST"
-        pause; return
-    fi
-    ok_inline "TLS-домен: ${TLS_MASK_DOMAIN}"
-
     # Сохраняем .env
     cat > .env <<EOF
 DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
 AD_TAG=${AD_TAG:-}
-TLS_DOMAIN=$TLS_MASK_DOMAIN
 EOF
     chmod 600 .env
 
@@ -588,28 +567,58 @@ EOF
     printf '  Генерирую config.py... '
     if [[ -n "$AD_TAG" ]]; then
         sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+            -e "s/__DOMAIN__/$DOMAIN/g" \
             -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
             config.py.template > config.py
     else
         sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+            -e "s/__DOMAIN__/$DOMAIN/g" \
             config.py.template > config.py
     fi
     chmod 644 config.py
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # Остановить возможные старые контейнеры (nginx, certbot от предыдущих версий)
+    printf '  Генерирую Caddyfile... '
+    cat > Caddyfile <<EOF
+${DOMAIN} {
+    respond "OK" 200
+    header Server "nginx"
+}
+EOF
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # Остановить возможные старые контейнеры
     printf '  Останавливаю старые контейнеры (если есть)... '
     $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    printf '  Запускаю alexbers... '
-    $COMPOSE up -d --build alexbers >/dev/null 2>&1
+    # Запускаем Caddy первым — он получает LE-сертификат для домена
+    printf '  Запускаю Caddy (получаю LE-сертификат)...'
+    $COMPOSE up -d caddy >/dev/null 2>&1
     local i=0
-    while (( i < 10 )); do
+    while (( i < 30 )); do
         sleep 1
         i=$((i+1))
+        printf '.'
+        if $COMPOSE logs caddy 2>/dev/null | grep -q "certificate obtained successfully"; then
+            break
+        fi
+    done
+    printf '\n'
+
+    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-caddy"; then
+        fail_inline "Caddy не запустился — проверь логи: $COMPOSE logs caddy"
+        pause; return
+    fi
+    ok_inline "Caddy запущен (LE-сертификат для ${DOMAIN})"
+
+    # Запускаем alexbers — он заберёт длину cert у Caddy при старте
+    printf '  Запускаю alexbers... '
+    $COMPOSE up -d --build alexbers >/dev/null 2>&1
+    local j=0
+    while (( j < 10 )); do
+        sleep 1
+        j=$((j+1))
         printf '.'
     done
     printf '\n'
@@ -621,16 +630,16 @@ EOF
     fi
     ok_inline "alexbers запущен"
 
-    local hex_mask link
-    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
+    local hex_domain link
+    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_domain}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
     printf '%sFakeTLS-ссылка:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
 
-    printf '%sЧто осталось вручную:%s\n' "$C_BLD" "$C_RST"
+    printf '%sЧто осталось вручную (для рекламы):%s\n' "$C_BLD" "$C_RST"
     printf '  1. @MTProxybot → /newproxy\n'
-    printf '  2. Введи: %s:443\n' "$DOMAIN"
+    printf '  2. Введи: %s:%s\n' "$DOMAIN" "$PROXY_PORT"
     printf '  3. Введи секрет: %s\n' "$BASE_SECRET"
     printf '  4. Сохрани AD_TAG из ответа бота\n'
     printf '  5. /myproxies → выбери прокси → Set promoted channel → @канал\n'
@@ -673,7 +682,7 @@ action_security() {
         unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
     fi
 
-    local whitelist=("$SSH_PORT" 443)
+    local whitelist=("$SSH_PORT" 80 443 853)
     is_whitelisted() {
         local p="$1"
         for wp in "${whitelist[@]}"; do
@@ -719,12 +728,14 @@ action_security() {
 
     printf '  Открываю порты: '
     ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
-    ufw allow 443/tcp comment "MTProto alexbers" >/dev/null 2>&1 || true
+    ufw allow 80/tcp comment "ACME challenge" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1 || true
+    ufw allow 853/tcp comment "MTProto alexbers" >/dev/null 2>&1 || true
     for port in "${extra_open[@]:-}"; do
         [[ -z "$port" ]] && continue
         ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
     done
-    printf '%s%s 443%s' "$C_CYN" "$SSH_PORT" "$C_RST"
+    printf '%s%s 80 443 853%s' "$C_CYN" "$SSH_PORT" "$C_RST"
     if [[ ${#extra_open[@]} -gt 0 ]]; then
         printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
     fi
@@ -883,7 +894,7 @@ action_show_link() {
         pause; return
     fi
 
-    local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
+    local DOMAIN="" BASE_SECRET=""
     # shellcheck source=/dev/null
     source .env
 
@@ -891,14 +902,13 @@ action_show_link() {
         fail_inline "В .env нет DOMAIN или BASE_SECRET"
         pause; return
     fi
-    local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
 
-    local hex_mask link
-    hex_mask=$(echo -n "$mask" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
+    local hex_domain link
+    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_domain}"
 
     printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
-    printf '%sФормат: ee (FakeTLS) + секрет + маска-домен (%s).%s\n' "$C_DIM" "$mask" "$C_RST"
+    printf '%sФормат: ee (FakeTLS) + секрет + домен-маска (%s), порт %s.%s\n' "$C_DIM" "$DOMAIN" "$PROXY_PORT" "$C_RST"
     pause
 }
 
@@ -1052,38 +1062,43 @@ action_self_update() {
         if confirm "Перегенерировать конфиги и перезапустить контейнеры?" N; then
             detect_compose
             if [[ -n "$COMPOSE" && -f .env ]]; then
-                local DOMAIN="" BASE_SECRET="" AD_TAG="" TLS_DOMAIN=""
+                local DOMAIN="" BASE_SECRET="" AD_TAG=""
                 # shellcheck source=/dev/null
                 source .env
-                local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
 
-                # Если TLS_DOMAIN не сохранён в .env — проверяем доступность
-                if [[ -z "${TLS_DOMAIN:-}" ]]; then
-                    printf '  Ищу доступный TLS-домен...\n'
-                    detect_tls_domain noisy || true
-                    mask="$TLS_MASK_DOMAIN"
-                    # Сохраняем в .env
-                    printf '\nTLS_DOMAIN=%s\n' "$mask" >> .env
+                # Генерируем Caddyfile если нет
+                if [[ ! -f Caddyfile ]]; then
+                    cat > Caddyfile <<CEOF
+${DOMAIN} {
+    respond "OK" 200
+    header Server "nginx"
+}
+CEOF
                 fi
 
                 # Обновляем config.py
                 if [[ -n "${AD_TAG:-}" ]]; then
                     sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                        -e "s/__TLS_DOMAIN__/$mask/g" \
+                        -e "s/__DOMAIN__/$DOMAIN/g" \
                         -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
                         config.py.template > config.py
                 else
                     sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                        -e "s/__TLS_DOMAIN__/$mask/g" \
+                        -e "s/__DOMAIN__/$DOMAIN/g" \
                         config.py.template > config.py
                 fi
                 chmod 644 config.py
 
-                # Останавливаем всё (включая nginx/certbot от старых версий)
+                # Останавливаем всё
                 printf '  Останавливаю старые контейнеры... '
                 $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
-                rm -f nginx.conf Caddyfile
                 printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+                # Сначала Caddy (получает LE-сертификат)
+                printf '  Запускаю Caddy...'
+                $COMPOSE up -d caddy >/dev/null 2>&1
+                sleep 15
+                printf '\n'
 
                 printf '  Запускаю alexbers... '
                 $COMPOSE up -d --build alexbers >/dev/null 2>&1
@@ -1251,115 +1266,29 @@ action_uninstall() {
     pause
 }
 
-# ============ ACTIONS: FIX TLS DOMAIN ============
-
-action_fix_tls_domain() {
-    print_header
-    printf '%s═══ Исправить TLS-домен ═══%s\n\n' "$C_BLD" "$C_RST"
-    printf '%sЭта операция обновляет TLS-маску в config.py и перезапускает прокси.%s\n' "$C_DIM" "$C_RST"
-    printf '%sПомогает когда прокси работает только через VPN.%s\n\n' "$C_DIM" "$C_RST"
-
-    if [[ ! -f .env ]]; then
-        fail_inline ".env не найден. Сначала установи прокси (пункт 2)."
-        pause; return
-    fi
-
-    local DOMAIN="" BASE_SECRET="" AD_TAG="" TLS_DOMAIN=""
-    # shellcheck source=/dev/null
-    source .env 2>/dev/null || true
-
-    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" ]]; then
-        fail_inline "В .env нет DOMAIN или BASE_SECRET — нужна полная переустановка (пункт 2)"
-        pause; return
-    fi
-
-    printf 'Текущий TLS_DOMAIN: %s%s%s\n\n' "$C_YLW" "${TLS_DOMAIN:-(не задан)}" "$C_RST"
-
-    printf 'Ищу доступный TLS-домен для FakeTLS-маскировки...\n'
-    if ! detect_tls_domain noisy; then
-        fail_inline "Ни один TLS-домен не доступен с этого VPS"
-        printf '%s  Возможно, VPS блокирует исходящий HTTPS.%s\n' "$C_DIM" "$C_RST"
-        pause; return
-    fi
-    ok_inline "Выбран: ${TLS_MASK_DOMAIN}"
-    printf '\n'
-
-    # Обновляем TLS_DOMAIN в .env
-    if grep -q '^TLS_DOMAIN=' .env; then
-        sed -i "s|^TLS_DOMAIN=.*|TLS_DOMAIN=${TLS_MASK_DOMAIN}|" .env
-    else
-        printf 'TLS_DOMAIN=%s\n' "$TLS_MASK_DOMAIN" >> .env
-    fi
-
-    # Перегенерируем config.py
-    printf '  Обновляю config.py... '
-    if [[ -n "${AD_TAG:-}" ]]; then
-        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
-            -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
-            config.py.template > config.py
-    else
-        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
-            config.py.template > config.py
-    fi
-    chmod 644 config.py
-
-    # Проверяем что плейсхолдеры заменены
-    if grep -qE '__TLS_DOMAIN__|__BASE_SECRET__' config.py 2>/dev/null; then
-        fail_inline "В config.py остались незаменённые плейсхолдеры — что-то пошло не так"
-        pause; return
-    fi
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    # Перезапускаем прокси
-    detect_compose
-    if [[ -n "$COMPOSE" ]] && $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
-        printf '  Перезапускаю alexbers... '
-        $COMPOSE restart alexbers >/dev/null 2>&1
-        sleep 3
-        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
-            printf '%sok%s\n' "$C_GRN" "$C_RST"
-        else
-            fail_inline "alexbers не запустился — проверь логи (пункт 5)"
-            pause; return
-        fi
-    else
-        printf '  %s(прокси не запущен, config.py обновлён — запусти вручную: пункт 8)%s\n' "$C_DIM" "$C_RST"
-    fi
-
-    local hex_mask link
-    hex_mask=$(echo -n "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${BASE_SECRET}${hex_mask}"
-
-    printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
-    printf '%sАктуальная ссылка:%s\n%s\n' "$C_BLD" "$C_RST" "$link"
-
-    pause
-}
-
 # ============ ACTIONS: TELEGRAM CHECK ============
 
 action_check_telegram() {
     print_header
     printf '%s═══ Проверка связи с Telegram ═══%s\n\n' "$C_BLD" "$C_RST"
 
-    # Читаем TLS_DOMAIN из .env если есть
+    # Читаем DOMAIN из .env
+    local DOMAIN=""
     if [[ -f .env ]]; then
-        local TLS_DOMAIN=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
-        [[ -n "${TLS_DOMAIN:-}" ]] && TLS_MASK_DOMAIN="$TLS_DOMAIN"
     fi
 
-    # Проверяем TLS-маскировочный домен
-    printf '%sFakeTLS-маскировка (TLS_DOMAIN = %s):%s\n' "$C_BLD" "$TLS_MASK_DOMAIN" "$C_RST"
-    if timeout 5 bash -c "echo >/dev/tcp/${TLS_MASK_DOMAIN}/443" 2>/dev/null; then
-        printf '  %s✓ %s:443 доступен — FakeTLS будет работать%s\n\n' "$C_GRN" "$TLS_MASK_DOMAIN" "$C_RST"
-    else
-        printf '  %s✗ %s:443 НЕДОСТУПЕН — FakeTLS не будет работать!%s\n' "$C_RED" "$TLS_MASK_DOMAIN" "$C_RST"
-        printf '  %sAlexbers не сможет получить TLS-cert → клиенты не подключатся.%s\n' "$C_DIM" "$C_RST"
-        printf '  %sПроверь альтернативы или обратись к хостеру.%s\n\n' "$C_DIM" "$C_RST"
+    # Проверяем Caddy (HTTPS на 443 для собственного домена)
+    if [[ -n "$DOMAIN" ]]; then
+        printf '%sCaddy / FakeTLS-маскировка (домен = %s):%s\n' "$C_BLD" "$DOMAIN" "$C_RST"
+        if timeout 5 bash -c "echo >/dev/tcp/${DOMAIN}/443" 2>/dev/null; then
+            printf '  %s✓ %s:443 доступен — Caddy слушает, FakeTLS работает%s\n\n' "$C_GRN" "$DOMAIN" "$C_RST"
+        else
+            printf '  %s✗ %s:443 НЕДОСТУПЕН — Caddy не запущен или порт закрыт!%s\n' "$C_RED" "$DOMAIN" "$C_RST"
+            printf '  %sAlexbers не сможет получить длину cert → клиенты не подключатся.%s\n' "$C_DIM" "$C_RST"
+            printf '  %sПроверь: docker compose logs caddy%s\n\n' "$C_DIM" "$C_RST"
+        fi
     fi
 
     printf 'Проверяю TCP-доступность датацентров Telegram с этого сервера...\n\n'
@@ -1447,7 +1376,6 @@ main() {
             12) action_install_shortcut ;;
             13) action_uninstall ;;
             14) action_check_telegram ;;
-            15) action_fix_tls_domain ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
