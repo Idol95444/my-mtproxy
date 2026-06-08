@@ -32,6 +32,8 @@ TELEMT_SVC="telemt"
 TLS_DOMAIN_CANDIDATES=("www.cloudflare.com" "www.apple.com" "www.microsoft.com" "www.bing.com")
 TLS_MASK_DOMAIN="www.cloudflare.com"
 
+AUDIT_LOG="/var/log/telemt-audit.jsonl"
+
 # ============ HELPERS ============
 
 require_root() {
@@ -322,6 +324,7 @@ ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
   ${C_CYN}7)${C_RST} Остановить прокси
   ${C_CYN}8)${C_RST} Запустить прокси
   ${C_CYN}9)${C_RST} Показать ссылку для пользователей
+  ${C_CYN}17)${C_RST} Статистика и аудит           ${C_DIM}(соединения, IP, трафик, гео)${C_RST}
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}10)${C_RST} Обновить систему              ${C_DIM}(apt update && upgrade)${C_RST}
@@ -1208,6 +1211,94 @@ action_set_adtag() {
     pause
 }
 
+# ============ ACTIONS: STATS & AUDIT ============
+
+action_stats() {
+    print_header
+    printf '%s═══ Статистика и аудит ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    local api_data
+    api_data=$(curl -s "http://127.0.0.1:${PROXY_API_PORT}/v1/users" 2>/dev/null || true)
+
+    if ! printf '%s' "$api_data" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+        fail_inline "telemt API недоступен — сервис не запущен?"
+        pause; return
+    fi
+
+    printf '%s' "$api_data" | python3 - <<'PYEOF'
+import sys, json
+
+data = json.load(sys.stdin)
+users = data['data']
+total_conns = sum(u.get('current_connections', 0) for u in users)
+total_ips   = sum(u.get('active_unique_ips', 0) for u in users)
+total_bytes = sum(u.get('total_octets', 0) for u in users)
+recent_ips  = sum(u.get('recent_unique_ips', 0) for u in users)
+gb = total_bytes / 1024**3
+
+print(f"  Соединений сейчас:  {total_conns}")
+print(f"  Уникальных IP:      {total_ips}")
+print(f"  Активных недавно:   {recent_ips}")
+print(f"  Трафик всего:       {gb:.2f} ГБ")
+
+if len(users) > 1:
+    print()
+    print("  По пользователям:")
+    for u in users:
+        tb = u.get('total_octets', 0) / 1024**3
+        exp = u.get('expiration_rfc3339') or '—'
+        quota = u.get('data_quota_bytes')
+        quota_str = f"{quota/1024**3:.1f}ГБ лимит" if quota else '—'
+        print(f"    {u['username']:10s}  {u.get('current_connections',0):4d} соед  "
+              f"{u.get('active_unique_ips',0):3d} IP  {tb:.2f}ГБ  до:{exp}  квота:{quota_str}")
+PYEOF
+
+    printf '\n%sТоп-10 IP по соединениям:%s\n' "$C_BLD" "$C_RST"
+    netstat -tn 2>/dev/null | awk '/ESTABLISHED/ && /:443 /{print $5}' \
+        | cut -d: -f1 | grep -v "^${PROXY_IP:-78\.17\.13\.219}$" \
+        | sort | uniq -c | sort -rn | head -10 \
+        | awk '{printf "  %4d  %s\n", $1, $2}'
+
+    printf '\n%sГео топ-3 IP:%s\n' "$C_BLD" "$C_RST"
+    local top3
+    top3=$(netstat -tn 2>/dev/null | awk '/ESTABLISHED/ && /:443 /{print $5}' \
+        | cut -d: -f1 | grep -v "^${PROXY_IP:-78\.17\.13\.219}$" \
+        | sort | uniq -c | sort -rn | head -3 | awk '{print $2}')
+    for ip in $top3; do
+        local info
+        info=$(curl -s --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null \
+            | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+org=d.get('org','?')[:35]
+print(d.get('country','?'), d.get('city','?'), org)
+" 2>/dev/null || echo "?")
+        printf '  %-18s %s\n' "$ip" "$info"
+    done
+
+    if [[ -f "$AUDIT_LOG" ]]; then
+        printf '\n%sИстория (последние 8 снапшотов):%s\n' "$C_BLD" "$C_RST"
+        tail -8 "$AUDIT_LOG" | python3 - <<'PYEOF'
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        ts = d.get('ts', '')[:16]
+        u  = d.get('data', [{}])[0]
+        c  = u.get('current_connections', '?')
+        i  = u.get('active_unique_ips', '?')
+        gb = u.get('total_octets', 0) / 1024**3
+        print(f"  {ts}  соед={c:<5} IP={i:<4} трафик={gb:.2f}ГБ")
+    except Exception:
+        pass
+PYEOF
+    else
+        printf '\n%sЛог аудита ещё не создан (cron запишет через 5 минут)%s\n' "$C_DIM" "$C_RST"
+    fi
+
+    pause
+}
+
 # ============ MAIN ============
 
 main() {
@@ -1239,6 +1330,7 @@ main() {
             14) action_check_telegram ;;
             15) action_update_telemt ;;
             16) action_set_adtag ;;
+            17) action_stats ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *) printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
