@@ -1,6 +1,6 @@
 [general]
 fast_mode = true
-use_middle_proxy = false
+use_middle_proxy = true
 
 [general.modes]
 classic = false
