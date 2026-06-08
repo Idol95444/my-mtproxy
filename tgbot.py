@@ -4,7 +4,7 @@ MTProxy Telegram Bot с inline-кнопками.
 Команды: /start /stats /users /adduser /link /quota /block /help
 Кнопки: навигация, управление пользователями, квоты, удаление с подтверждением.
 """
-import json, os, sys, time, secrets, subprocess, urllib.request, urllib.parse
+import json, os, re, sys, time, secrets, subprocess, urllib.request, urllib.parse
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
@@ -191,11 +191,12 @@ def build_users():
         icon  = "✅" if u.get("enabled", True) else "🚫"
         gb    = u.get("total_octets", 0) / 1024**3
         conn  = u.get("current_connections", 0)
+        ips   = u.get("active_unique_ips", 0)
         quota = u.get("data_quota_bytes")
         exp   = (u.get("expiration_rfc3339") or "")[:10]
         extra = (f" | лимит:{quota/1024**3:.0f}ГБ" if quota else "") + \
                 (f" | до:{exp}" if exp else "")
-        lines.append(f"{icon} <b>{u['username']}</b> — {conn} соед, {gb:.2f}ГБ{extra}")
+        lines.append(f"{icon} <b>{u['username']}</b> — {conn} соед, {ips} IP, {gb:.2f}ГБ{extra}")
     lines.append("\nВыбери пользователя ↓")
     return "\n".join(lines), kb_users(users)
 
@@ -338,10 +339,18 @@ def cmd_users(chat_id, _):
 def cmd_adduser(chat_id, args):
     if not args:
         send(chat_id, "Использование: /adduser &lt;имя&gt;"); return
-    name   = args[0]
-    secret = secrets.token_hex(16)
+    name    = args[0]
+    if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', name):
+        send(chat_id, "❌ Имя пользователя: только латиница, цифры, `-`, `_`, до 32 символов"); return
+    secret  = secrets.token_hex(16)
+    cfg     = load_env()
+    ad_tag  = cfg.get("AD_TAG") or None
 
-    r = api_call("POST", "/v1/users", {"username": name, "secret": secret})
+    payload = {"username": name, "secret": secret}
+    if ad_tag:
+        payload["user_ad_tag"] = ad_tag
+
+    r = api_call("POST", "/v1/users", payload)
     if not r.get("ok"):
         toml = load_env().get("TELEMT_CONF", "/etc/telemt/telemt.toml")
         try:
@@ -353,6 +362,12 @@ def cmd_adduser(chat_id, args):
                                           f"[access.users]\n{name} = \"{secret}\"", 1)
             else:
                 content += f'\n[access.users]\n{name} = "{secret}"\n'
+            if ad_tag:
+                if "[access.user_ad_tags]" in content:
+                    content = content.replace("[access.user_ad_tags]",
+                                              f"[access.user_ad_tags]\n{name} = \"{ad_tag}\"", 1)
+                else:
+                    content += f'\n[access.user_ad_tags]\n{name} = "{ad_tag}"\n'
             with open(toml, "w") as f: f.write(content)
             subprocess.run(["systemctl", "restart", "telemt"],
                            check=True, capture_output=True)
