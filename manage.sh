@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# pipefail умышленно НЕ включён: интерактивный TUI много работает с pipe'ами
-# где допустим non-zero exit одной из команд (grep без совпадений и т.п.)
+# set -o pipefail не используем: grep без совпадений даёт non-zero, это нормально в TUI
 set -eu
-
-# ============================================================
-# manage.sh — установщик и менеджер MTProto-прокси
-# Использование: sudo bash manage.sh
-# ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -28,10 +22,15 @@ fi
 
 # ============ GLOBALS ============
 
-COMPOSE=""
 SSH_PORT="22"
+PROXY_PORT="443"
+PROXY_API_PORT="9091"
+TELEMT_BIN="/bin/telemt"
+TELEMT_CONF="/etc/telemt/telemt.toml"
+TELEMT_SVC="telemt"
 
-PROXY_PORT="853"
+TLS_DOMAIN_CANDIDATES=("www.cloudflare.com" "www.apple.com" "www.microsoft.com" "www.bing.com")
+TLS_MASK_DOMAIN="www.cloudflare.com"
 
 # ============ HELPERS ============
 
@@ -48,10 +47,11 @@ require_root() {
 
 ensure_deps() {
     local need=()
-    command -v ss >/dev/null 2>&1 || need+=(iproute2)
-    command -v xxd >/dev/null 2>&1 || need+=(xxd)
-    command -v dig >/dev/null 2>&1 || need+=(dnsutils)
-    command -v git >/dev/null 2>&1 || need+=(git)
+    command -v ss      >/dev/null 2>&1 || need+=(iproute2)
+    command -v xxd     >/dev/null 2>&1 || need+=(xxd)
+    command -v dig     >/dev/null 2>&1 || need+=(dnsutils)
+    command -v git     >/dev/null 2>&1 || need+=(git)
+    command -v curl    >/dev/null 2>&1 || need+=(curl)
     if [[ ${#need[@]} -gt 0 ]]; then
         printf '%sУстанавливаю зависимости: %s%s\n' "$C_DIM" "${need[*]}" "$C_RST"
         apt update >/dev/null 2>&1
@@ -59,68 +59,42 @@ ensure_deps() {
     fi
 }
 
-# Создаёт симлинк /usr/local/bin/proxy → этот скрипт.
-# При следующем запуске можно будет писать просто `sudo proxy` из любого места.
 install_shortcut() {
     local target="/usr/local/bin/proxy"
     local script_path="${SCRIPT_DIR}/manage.sh"
-    local quiet="${1:-noisy}"  # quiet — не печатать ничего если уже установлено
+    local quiet="${1:-noisy}"
 
-    # Уже установлен и указывает сюда — выход
     if [[ -L "$target" ]] && [[ "$(readlink -f "$target" 2>/dev/null)" == "$script_path" ]]; then
         [[ "$quiet" == "noisy" ]] && printf '%s✓%s Команда %ssudo proxy%s уже установлена\n' \
             "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
         return 0
     fi
 
-    # Что-то другое лежит — не трогаем
     if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
-        printf '%s⚠%s По пути %s лежит обычный файл — не трогаю\n' \
-            "$C_YLW" "$C_RST" "$target"
+        printf '%s⚠%s По пути %s лежит обычный файл — не трогаю\n' "$C_YLW" "$C_RST" "$target"
         return 1
     fi
 
-    # Делаем сам скрипт исполняемым (для запуска через симлинк)
     chmod +x "$script_path" 2>/dev/null || true
 
-    # Создаём симлинк
     if ! ln -sf "$script_path" "$target" 2>/dev/null; then
         printf '%s✗%s Не удалось создать %s\n' "$C_RED" "$C_RST" "$target"
-        printf '%s   Возможно /usr/local/bin недоступен или не существует.%s\n' "$C_DIM" "$C_RST"
         return 1
     fi
 
-    # Сбросить bash hash table в текущем shell
     hash -r 2>/dev/null || true
 
-    printf '\n%s✓%s Команда %ssudo proxy%s установлена\n' \
-        "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
-    printf '%s   Если в текущем терминале %ssudo proxy%s выдаёт "command not found" —\n' \
-        "$C_DIM" "$C_BLD$C_DIM" "$C_DIM"
-    printf '%s   выполни %shash -r%s или открой новую SSH-сессию.%s\n\n' \
-        "$C_DIM" "$C_BLD$C_DIM" "$C_DIM" "$C_RST"
+    printf '\n%s✓%s Команда %ssudo proxy%s установлена\n' "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
+    printf '%s   Если в текущем терминале sudo proxy выдаёт "command not found" —%s\n' "$C_DIM" "$C_RST"
+    printf '%s   выполни %shash -r%s или открой новую SSH-сессию.%s\n\n' "$C_DIM" "$C_BLD$C_DIM" "$C_DIM" "$C_RST"
     sleep 2
     return 0
 }
 
-# Тихий вариант для главного цикла — не печатает ничего если всё уже ОК
-ensure_shortcut() {
-    install_shortcut quiet
-}
-
-detect_compose() {
-    if docker compose version &>/dev/null; then
-        COMPOSE="docker compose"
-    elif docker-compose version &>/dev/null; then
-        COMPOSE="docker-compose"
-    else
-        COMPOSE=""
-    fi
-}
+ensure_shortcut() { install_shortcut quiet; }
 
 detect_ssh_port() {
     local port=""
-    # awk вместо grep — не падает при отсутствии совпадений (важно при set -e + pipefail)
     port=$(awk '/^[Pp]ort / {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
     SSH_PORT="${port:-22}"
 }
@@ -156,34 +130,46 @@ prompt_value() {
     printf '%s' "${input:-$default}"
 }
 
-ok_inline() {
-    printf '%s✓ %s%s\n' "$C_GRN" "$1" "$C_RST"
+ok_inline()   { printf '%s✓ %s%s\n' "$C_GRN" "$1" "$C_RST"; }
+fail_inline() { printf '%s✗ %s%s\n' "$C_RED" "$1" "$C_RST"; }
+step()        { printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"; }
+
+detect_tls_domain() {
+    local quiet="${1:-noisy}"
+    for candidate in "${TLS_DOMAIN_CANDIDATES[@]}"; do
+        [[ "$quiet" == "noisy" ]] && printf '    Пробую %s... ' "$candidate"
+        if timeout 5 bash -c "echo >/dev/tcp/${candidate}/443" 2>/dev/null; then
+            TLS_MASK_DOMAIN="$candidate"
+            [[ "$quiet" == "noisy" ]] && printf '%sдоступен%s\n' "$C_GRN" "$C_RST"
+            return 0
+        else
+            [[ "$quiet" == "noisy" ]] && printf '%sнедоступен%s\n' "$C_DIM" "$C_RST"
+        fi
+    done
+    return 1
 }
 
-fail_inline() {
-    printf '%s✗ %s%s\n' "$C_RED" "$1" "$C_RST"
+install_telemt_binary() {
+    local url="https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz"
+    if curl -fsSL "$url" | tar -xz -C /tmp 2>/dev/null && [[ -f /tmp/telemt ]]; then
+        mv /tmp/telemt "$TELEMT_BIN"
+        chmod +x "$TELEMT_BIN"
+        return 0
+    fi
+    return 1
 }
 
-step() {
-    printf '%s[%s]%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"
-}
-
-
-# Проверка домена: правильный ли IP, пропагировал ли DNS, свободен ли порт 80
-# Возвращает 0 если всё ОК, 1 если есть критичные ошибки.
-# Печатает предупреждения но не валит на них (warnings не блокируют).
 check_dns_health() {
     local domain="$1"
     local errors=0 warnings=0
 
     printf '\n%sПроверка DNS и доступности:%s\n' "$C_BLD" "$C_RST"
 
-    # 1. Публичный IP этого сервера
     local server_ip
     server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
                 curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
                 curl -s --max-time 5 https://icanhazip.com 2>/dev/null)
-    server_ip=$(echo -n "$server_ip" | tr -d '[:space:]')
+    server_ip=$(printf '%s' "$server_ip" | tr -d '[:space:]')
     if [[ -z "$server_ip" ]]; then
         printf '  %s✗ Не удалось определить публичный IP сервера%s\n' "$C_RED" "$C_RST"
         errors=$((errors+1))
@@ -191,7 +177,6 @@ check_dns_health() {
         printf '  %s✓%s Публичный IP этого VPS: %s%s%s\n' "$C_GRN" "$C_RST" "$C_BLD" "$server_ip" "$C_RST"
     fi
 
-    # 2. A-записи через локальный резолвер
     local resolved_ips
     resolved_ips=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' || true)
     if [[ -z "$resolved_ips" ]]; then
@@ -201,38 +186,32 @@ check_dns_health() {
     fi
 
     local ip_count
-    ip_count=$(echo "$resolved_ips" | wc -l | tr -d ' ')
+    ip_count=$(printf '%s\n' "$resolved_ips" | wc -l | tr -d ' ')
     if (( ip_count > 1 )); then
-        printf '  %s✗%s У домена несколько A-записей:\n' "$C_RED" "$C_RST"
-        echo "$resolved_ips" | sed "s/^/      /"
-        printf '      %sLet'"'"'s Encrypt проверяет ВСЕ A-записи.%s\n' "$C_YLW" "$C_RST"
-        printf '      %sЕсли хоть одна не отвечает — cert не выпустится.%s\n' "$C_YLW" "$C_RST"
-        printf '      %sОставь только одну запись на этот VPS.%s\n' "$C_YLW" "$C_RST"
-        errors=$((errors+1))
+        printf '  %s⚠%s У домена несколько A-записей:\n' "$C_YLW" "$C_RST"
+        printf '%s\n' "$resolved_ips" | sed "s/^/      /"
+        warnings=$((warnings+1))
     else
-        printf '  %s✓%s A-запись (локальный DNS): %s\n' "$C_GRN" "$C_RST" "$resolved_ips"
+        printf '  %s✓%s A-запись: %s\n' "$C_GRN" "$C_RST" "$resolved_ips"
     fi
 
-    # 3. Совпадает ли A-запись с IP сервера
     if [[ -n "$server_ip" ]]; then
-        if echo "$resolved_ips" | grep -qx "$server_ip"; then
+        if printf '%s\n' "$resolved_ips" | grep -qx "$server_ip"; then
             printf '  %s✓%s Домен указывает на этот сервер\n' "$C_GRN" "$C_RST"
         else
-            printf '  %s✗%s Ни одна A-запись не указывает на этот сервер!\n' "$C_RED" "$C_RST"
+            printf '  %s✗%s Домен не указывает на этот сервер!\n' "$C_RED" "$C_RST"
             printf '      VPS: %s\n' "$server_ip"
-            printf '      DNS: %s\n' "$(echo "$resolved_ips" | tr '\n' ' ')"
+            printf '      DNS: %s\n' "$(printf '%s\n' "$resolved_ips" | tr '\n' ' ')"
             errors=$((errors+1))
         fi
     fi
 
-    # 4. Внешние DNS (Cloudflare и Google) — пропагация
     local cf_ip="" google_ip=""
     cf_ip=$(dig @1.1.1.1 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
     google_ip=$(dig @8.8.8.8 +short +time=3 +tries=1 "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
 
     if [[ -z "$cf_ip" ]]; then
-        printf '  %s⚠%s Cloudflare DNS (1.1.1.1) пока не видит домен — DNS не пропагировал\n' \
-            "$C_YLW" "$C_RST"
+        printf '  %s⚠%s Cloudflare DNS (1.1.1.1) не видит домен — DNS не пропагировал\n' "$C_YLW" "$C_RST"
         warnings=$((warnings+1))
     elif [[ -n "$server_ip" && "$cf_ip" != "$server_ip" ]]; then
         printf '  %s⚠%s Cloudflare DNS видит другой IP: %s\n' "$C_YLW" "$C_RST" "$cf_ip"
@@ -242,7 +221,7 @@ check_dns_health() {
     fi
 
     if [[ -z "$google_ip" ]]; then
-        printf '  %s⚠%s Google DNS (8.8.8.8) пока не видит домен\n' "$C_YLW" "$C_RST"
+        printf '  %s⚠%s Google DNS (8.8.8.8) не видит домен\n' "$C_YLW" "$C_RST"
         warnings=$((warnings+1))
     elif [[ -n "$server_ip" && "$google_ip" != "$server_ip" ]]; then
         printf '  %s⚠%s Google DNS видит другой IP: %s\n' "$C_YLW" "$C_RST" "$google_ip"
@@ -251,60 +230,32 @@ check_dns_health() {
         printf '  %s✓%s Google DNS видит: %s\n' "$C_GRN" "$C_RST" "$google_ip"
     fi
 
-    # 5. Порт 80 — для ACME-challenge (Let's Encrypt через Caddy)
-    local p80_user=""
-    p80_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:80$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
-    if [[ -n "$p80_user" ]]; then
-        if echo "$p80_user" | grep -qE '"caddy"|"docker-proxy"|"nginx"'; then
-            printf '  %s⚠%s Порт 80 занят предыдущим контейнером (будет остановлен): %s\n' "$C_YLW" "$C_RST" "$p80_user"
-            warnings=$((warnings+1))
-        else
-            printf '  %s✗%s Порт 80 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p80_user"
-            printf '      %sCaddy не сможет пройти ACME-challenge → LE-сертификат не выпустится.%s\n' "$C_DIM" "$C_RST"
-            errors=$((errors+1))
-        fi
-    else
-        printf '  %s✓%s Порт 80 свободен (ACME-challenge)\n' "$C_GRN" "$C_RST"
-    fi
-
-    # 6. Порт 443 — для Caddy (HTTPS/LE). Должен быть свободен или наш.
     local p443_user=""
     p443_user=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
     if [[ -n "$p443_user" ]]; then
-        if echo "$p443_user" | grep -qE '"caddy"|"docker-proxy"|"nginx"|"python3"'; then
-            printf '  %s⚠%s Порт 443 занят предыдущим контейнером (будет остановлен): %s\n' "$C_YLW" "$C_RST" "$p443_user"
-            printf '      %sДеплой сам остановит его через docker compose down.%s\n' "$C_DIM" "$C_RST"
-            warnings=$((warnings+1))
+        if printf '%s' "$p443_user" | grep -qE '"telemt"'; then
+            printf '  %s✓%s Порт 443 занят telemt (текущий деплой)\n' "$C_GRN" "$C_RST"
         else
             local hint=""
-            if echo "$p443_user" | grep -qE '"rw-core"|"remnawave"'; then
-                hint="Remnawave — архитектурный конфликт: оба хотят порт 443."
-            elif echo "$p443_user" | grep -qE '"haproxy"'; then
-                hint="haproxy — отключи или убери его с 443."
-            elif echo "$p443_user" | grep -qE '"xray"|"v2ray"|"singbox"|"sing-box"'; then
-                hint="Xray/V2Ray/sing-box — другой прокси уже использует 443."
-            fi
+            printf '%s' "$p443_user" | grep -qE '"caddy"'    && hint="Caddy — останови: docker stop mtproxy-caddy"
+            printf '%s' "$p443_user" | grep -qE '"nginx"'    && hint="nginx — отключи или убери с 443"
+            printf '%s' "$p443_user" | grep -qE '"python3"'  && hint="Старый alexbers — останови: docker compose down"
             printf '  %s✗%s Порт 443 занят чужим процессом: %s\n' "$C_RED" "$C_RST" "$p443_user"
             [[ -n "$hint" ]] && printf '      %s%s%s\n' "$C_YLW" "$hint" "$C_RST"
-            printf '      %sCaddy не сможет занять 443 → LE-сертификат не выпустится.%s\n' "$C_DIM" "$C_RST"
+            printf '      %stelemt не сможет занять 443.%s\n' "$C_DIM" "$C_RST"
             errors=$((errors+1))
         fi
     else
-        printf '  %s✓%s Порт 443 свободен (Caddy)\n' "$C_GRN" "$C_RST"
+        printf '  %s✓%s Порт 443 свободен — telemt займёт его\n' "$C_GRN" "$C_RST"
     fi
 
-    # Итог
     printf '\n'
     if (( errors > 0 )); then
         printf '  %sНайдено критичных ошибок: %d%s\n' "$C_RED" "$errors" "$C_RST"
-        printf '  %sПрокси не запустится с такими настройками.%s\n' "$C_RED" "$C_RST"
         return 1
     fi
-    if (( warnings > 0 )); then
-        printf '  %sПредупреждений: %d (не блокирует, но обрати внимание)%s\n' "$C_YLW" "$warnings" "$C_RST"
-    else
-        printf '  %sВсе проверки пройдены%s\n' "$C_GRN" "$C_RST"
-    fi
+    (( warnings > 0 )) && printf '  %sПредупреждений: %d (не блокирует)%s\n' "$C_YLW" "$warnings" "$C_RST" \
+                       || printf '  %sВсе проверки пройдены%s\n' "$C_GRN" "$C_RST"
     return 0
 }
 
@@ -320,32 +271,23 @@ HEADER
 }
 
 print_status() {
-    detect_compose
-
     local domain="${C_DIM}не установлен${C_RST}"
     local proxy_state="${C_DIM}не запущен${C_RST}"
-    local ad_tag_state="${C_DIM}нет${C_RST}"
+    local tls_mask="$TLS_MASK_DOMAIN"
     local ufw_state="${C_DIM}не настроен${C_RST}"
 
-    local caddy_state="${C_DIM}не запущен${C_RST}"
-
     if [[ -f .env ]]; then
-        local DOMAIN="" AD_TAG=""
+        local DOMAIN="" TLS_DOMAIN=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
-        [[ -n "${DOMAIN:-}" ]] && domain="$DOMAIN"
-        [[ -n "${AD_TAG:-}" ]] && ad_tag_state="${C_GRN}настроен${C_RST}"
+        [[ -n "${DOMAIN:-}"     ]] && domain="$DOMAIN"
+        [[ -n "${TLS_DOMAIN:-}" ]] && tls_mask="$TLS_DOMAIN"
     fi
 
-    if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
-        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
-            proxy_state="${C_GRN}запущен${C_RST}"
-        else
-            proxy_state="${C_YLW}остановлен${C_RST}"
-        fi
-        if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-caddy"; then
-            caddy_state="${C_GRN}запущен${C_RST}"
-        fi
+    if systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1; then
+        proxy_state="${C_GRN}запущен${C_RST}"
+    elif systemctl is-enabled "$TELEMT_SVC" >/dev/null 2>&1; then
+        proxy_state="${C_YLW}остановлен${C_RST}"
     fi
 
     if command -v ufw >/dev/null 2>&1; then
@@ -359,27 +301,25 @@ print_status() {
     cat <<STATUS
 
   ${C_BLD}Домен:${C_RST}      ${domain}
-  ${C_BLD}Caddy:${C_RST}      ${caddy_state}    ${C_DIM}(порт 80, 443 — LE-сертификат)${C_RST}
-  ${C_BLD}alexbers:${C_RST}   ${proxy_state}    ${C_DIM}(порт 853 — FakeTLS-прокси)${C_RST}
-  ${C_BLD}AD_TAG:${C_RST}     ${ad_tag_state}
+  ${C_BLD}telemt:${C_RST}     ${proxy_state}    ${C_DIM}(порт ${PROXY_PORT}, маска: ${tls_mask}, MSS=tspu)${C_RST}
   ${C_BLD}Файрвол:${C_RST}    ${ufw_state}
+
 STATUS
-    printf '\n'
 }
 
 print_menu() {
     cat <<MENU
 ${C_BLD}═══ УСТАНОВКА ═══${C_RST}
-  ${C_CYN}1)${C_RST} Проверить домен              ${C_DIM}(DNS, IP, порты — без установки)${C_RST}
-  ${C_CYN}2)${C_RST} Установить прокси            ${C_DIM}(домен, секрет, AD_TAG)${C_RST}
-  ${C_CYN}3)${C_RST} Настроить безопасность VPS   ${C_DIM}(ufw, fail2ban, sysctl)${C_RST}
+  ${C_CYN}1)${C_RST} Проверить домен              ${C_DIM}(DNS, IP — без установки)${C_RST}
+  ${C_CYN}2)${C_RST} Установить прокси            ${C_DIM}(telemt, client_mss=tspu)${C_RST}
+  ${C_CYN}3)${C_RST} Настроить безопасность VPS   ${C_DIM}(ufw, fail2ban, keepalive, rate-limit)${C_RST}
 
 ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
-  ${C_CYN}4)${C_RST} Статус контейнеров
-  ${C_CYN}5)${C_RST} Логи alexbers                ${C_DIM}(live, Ctrl+C — выход)${C_RST}
+  ${C_CYN}4)${C_RST} Статус сервиса
+  ${C_CYN}5)${C_RST} Логи telemt                  ${C_DIM}(live, Ctrl+C — выход)${C_RST}
   ${C_CYN}6)${C_RST} Перезапустить прокси
-  ${C_CYN}7)${C_RST} Остановить всё
-  ${C_CYN}8)${C_RST} Запустить всё
+  ${C_CYN}7)${C_RST} Остановить прокси
+  ${C_CYN}8)${C_RST} Запустить прокси
   ${C_CYN}9)${C_RST} Показать ссылку для пользователей
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
@@ -387,7 +327,8 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}11)${C_RST} Обновить скрипт из git
   ${C_CYN}12)${C_RST} Установить команду proxy      ${C_DIM}(если не работает sudo proxy)${C_RST}
   ${C_CYN}13)${C_RST} Удалить прокси
-  ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/853/8888)${C_RST}
+  ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/8888)${C_RST}
+  ${C_CYN}15)${C_RST} Обновить telemt              ${C_DIM}(скачать последнюю версию)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -397,20 +338,16 @@ MENU
 # ============ ACTIONS: CHECK DOMAIN ============
 
 action_check_domain() {
-    # Дефолт из .env если есть
     local DOMAIN=""
     if [[ -f .env ]]; then
-        local _D=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
         DOMAIN="${DOMAIN:-}"
     fi
 
-    # Первый ввод домена
     print_header
     printf '%s═══ Проверка домена ═══%s\n\n' "$C_BLD" "$C_RST"
-    printf '%sПроверим всё что нужно для выпуска LE-сертификата.%s\n' "$C_DIM" "$C_RST"
-    printf '%sНичего не устанавливается и не меняется.%s\n\n' "$C_DIM" "$C_RST"
+    printf '%sПроверяем DNS и порт 443 — ничего не устанавливается.%s\n\n' "$C_DIM" "$C_RST"
 
     DOMAIN=$(prompt_value "Домен для проверки" "$DOMAIN")
     if [[ -z "$DOMAIN" ]]; then
@@ -418,43 +355,31 @@ action_check_domain() {
         pause; return
     fi
 
-    # Цикл: проверка → выбор действия → повтор
     while true; do
         print_header
         printf '%s═══ Проверка домена: %s%s%s ═══%s\n' "$C_BLD" "$C_CYN" "$DOMAIN" "$C_RST$C_BLD" "$C_RST"
 
-        if check_dns_health "$DOMAIN"; then
-            printf '\n%sДомен готов к выпуску сертификата.%s\n' "$C_GRN" "$C_RST"
-        else
-            printf '\n%sДо устранения ошибок Let'"'"'s Encrypt cert не выпустит.%s\n' "$C_RED" "$C_RST"
-        fi
+        check_dns_health "$DOMAIN" \
+            && printf '\n%sДомен готов для telemt.%s\n' "$C_GRN" "$C_RST" \
+            || printf '\n%sЕсть проблемы — исправь перед деплоем.%s\n' "$C_RED" "$C_RST"
 
         printf '\n%s───────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
-        printf '  %sr)%s Обновить — повторить проверку (DNS мог пропагировать)\n' "$C_CYN" "$C_RST"
+        printf '  %sr)%s Повторить проверку\n' "$C_CYN" "$C_RST"
         printf '  %sd)%s Сменить домен\n' "$C_CYN" "$C_RST"
-        printf '  %s0)%s Назад в меню\n\n' "$C_DIM" "$C_RST"
+        printf '  %s0)%s Назад\n\n' "$C_DIM" "$C_RST"
         printf '%sВыбор:%s ' "$C_BLD" "$C_RST"
 
         local choice
         read -r choice </dev/tty || return
         case "$choice" in
-            r|R|"")
-                continue
-                ;;
+            r|R|"") continue ;;
             d|D)
                 local new_domain
                 new_domain=$(prompt_value "Новый домен" "$DOMAIN")
-                if [[ -n "$new_domain" ]]; then
-                    DOMAIN="$new_domain"
-                fi
+                [[ -n "$new_domain" ]] && DOMAIN="$new_domain"
                 ;;
-            0|q|Q|exit)
-                return
-                ;;
-            *)
-                printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"
-                sleep 1
-                ;;
+            0|q|Q|exit) return ;;
+            *) printf '%sНеверный выбор%s\n' "$C_RED" "$C_RST"; sleep 1 ;;
         esac
     done
 }
@@ -463,15 +388,15 @@ action_check_domain() {
 
 action_deploy() {
     print_header
-    printf '%s═══ Установка прокси ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%s═══ Установка прокси (telemt) ═══%s\n\n' "$C_BLD" "$C_RST"
 
-    local DOMAIN="" BASE_SECRET="" AD_TAG=""
+    local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
     if [[ -f .env ]]; then
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
     fi
 
-    step "1/3" "Домен (с A-записью на этот VPS)"
+    step "1/3" "Домен (A-запись должна указывать на этот VPS)"
     DOMAIN=$(prompt_value "Введи домен" "$DOMAIN")
     if [[ -z "$DOMAIN" ]]; then
         fail_inline "DOMAIN не может быть пустым"
@@ -485,46 +410,44 @@ action_deploy() {
         BASE_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
         ok_inline "Сгенерирован: ${BASE_SECRET}"
     elif ! [[ "$BASE_SECRET" =~ ^[0-9a-fA-F]{32}$ ]]; then
-        fail_inline "BASE_SECRET должен быть 32 hex-символа (0-9, a-f)"
+        fail_inline "BASE_SECRET должен быть ровно 32 hex-символа (0-9, a-f)"
         pause; return
     fi
     printf '\n'
 
-    step "3/3" "AD_TAG (необязательно, можно вписать позже)"
-    printf '       Получи в @MTProxybot через /newproxy\n'
-    AD_TAG=$(prompt_value "AD_TAG" "$AD_TAG")
+    step "3/3" "TLS-маскировочный домен (CDN, который telemt будет имитировать)"
+    printf '       Telemt скачает реальный сертификат этого сайта.\n'
+    printf '       Ищу доступный с этого VPS...\n'
+    if detect_tls_domain noisy; then
+        ok_inline "Авто-выбран: ${TLS_MASK_DOMAIN}"
+    else
+        fail_inline "Ни один CDN-домен недоступен с этого VPS — нет исходящего HTTPS?"
+        pause; return
+    fi
     printf '\n'
 
-    # Развёрнутая проверка DNS, IP, портов
     if ! check_dns_health "$DOMAIN"; then
-        printf '\n%sЧто делать:%s\n' "$C_BLD" "$C_RST"
-        printf '  • Если порт 443 занят %sRemnawave (rw-core)%s или другим прокси —\n' \
-            "$C_YLW" "$C_RST"
-        printf '    архитектурный конфликт: оба хотят 443. Варианты:\n'
-        printf '    1) Развернуть MTProto на отдельном VPS (рекомендую)\n'
-        printf '    2) Временно остановить конфликтующий сервис для установки,\n'
-        printf '       затем запустить обратно (разберись вручную)\n'
-        printf '  • Если несколько A-записей у домена — оставь только одну на этот VPS\n'
-        printf '  • Если DNS не пропагировал — подожди 5-10 минут и повтори проверку\n\n'
-        if ! confirm "Продолжить несмотря на ошибки? (НЕ рекомендую)" N; then
+        printf '\n'
+        if ! confirm "Продолжить несмотря на ошибки? (не рекомендую)" N; then
             return
         fi
     fi
 
     printf '\n%sИтого:%s\n' "$C_BLD" "$C_RST"
-    printf '  Домен:    %s\n' "$DOMAIN"
-    printf '  Секрет:   %s\n' "$BASE_SECRET"
-    printf '  AD_TAG:   %s\n\n' "${AD_TAG:-(пусто)}"
+    printf '  Домен:      %s\n' "$DOMAIN"
+    printf '  Секрет:     %s\n' "$BASE_SECRET"
+    printf '  TLS-маска:  %s\n' "$TLS_MASK_DOMAIN"
+    printf '  Порт:       %s\n' "$PROXY_PORT"
+    printf '  client_mss: tspu (обход DPI ТСПУ)\n\n'
 
     if ! confirm "Запустить установку?" Y; then
         return
     fi
 
-    # Сохраняем .env
     cat > .env <<EOF
 DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
-AD_TAG=${AD_TAG:-}
+TLS_DOMAIN=$TLS_MASK_DOMAIN
 EOF
     chmod 600 .env
 
@@ -534,116 +457,97 @@ EOF
     apt update >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    if ! command -v docker &>/dev/null; then
-        printf '  Устанавливаю Docker... '
-        apt install -y docker.io git curl >/dev/null 2>&1
-        systemctl enable --now docker >/dev/null 2>&1
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '  Docker: %sуже установлен%s\n' "$C_DIM" "$C_RST"
-    fi
-
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        printf '  Устанавливаю docker-compose... '
-        apt install -y docker-compose-v2 >/dev/null 2>&1 || apt install -y docker-compose >/dev/null 2>&1
-        detect_compose
-        printf '%sok%s (%s)\n' "$C_GRN" "$C_RST" "$COMPOSE"
-    else
-        printf '  Compose: %s%s%s\n' "$C_DIM" "$COMPOSE" "$C_RST"
-    fi
-
-    if [[ -d src/.git ]]; then
-        printf '  Обновляю alexbers/mtprotoproxy... '
-        git -C src pull >/dev/null 2>&1
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '  Клонирую alexbers/mtprotoproxy... '
-        rm -rf src
-        git clone -b stable https://github.com/alexbers/mtprotoproxy.git src >/dev/null 2>&1
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    fi
-
-    printf '  Генерирую config.py... '
-    if [[ -n "$AD_TAG" ]]; then
-        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__DOMAIN__/$DOMAIN/g" \
-            -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
-            config.py.template > config.py
-    else
-        sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-            -e "s/__DOMAIN__/$DOMAIN/g" \
-            config.py.template > config.py
-    fi
-    chmod 644 config.py
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    printf '  Генерирую Caddyfile... '
-    cat > Caddyfile <<EOF
-${DOMAIN} {
-    respond "OK" 200
-    header Server "nginx"
-}
-EOF
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    # Остановить возможные старые контейнеры
-    printf '  Останавливаю старые контейнеры (если есть)... '
-    $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    # Запускаем Caddy первым — он получает LE-сертификат для домена
-    printf '  Запускаю Caddy (получаю LE-сертификат)...'
-    $COMPOSE up -d caddy >/dev/null 2>&1
-    local i=0
-    while (( i < 30 )); do
-        sleep 1
-        i=$((i+1))
-        printf '.'
-        if $COMPOSE logs caddy 2>/dev/null | grep -q "certificate obtained successfully"; then
-            break
+    if command -v docker >/dev/null 2>&1; then
+        local old
+        old=$(docker ps -q --filter "name=mtproto-final" --filter "name=mtproxy-caddy" 2>/dev/null || true)
+        if [[ -n "$old" ]]; then
+            printf '  Останавливаю старые контейнеры... '
+            # shellcheck disable=SC2086
+            docker stop $old >/dev/null 2>&1 || true
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
         fi
+    fi
+
+    if [[ -x "$TELEMT_BIN" ]]; then
+        printf '  telemt: %sуже установлен%s (%s)\n' "$C_DIM" "$C_RST" \
+            "$("$TELEMT_BIN" --version 2>/dev/null | head -1 || echo 'версия неизвестна')"
+    else
+        printf '  Скачиваю telemt... '
+        if install_telemt_binary; then
+            printf '%sok%s (%s)\n' "$C_GRN" "$C_RST" \
+                "$("$TELEMT_BIN" --version 2>/dev/null | head -1 || echo 'ok')"
+        else
+            fail_inline "Не удалось скачать telemt"
+            printf '%s  Проверь: curl -fsSL https://github.com/telemt/telemt/releases/latest%s\n' "$C_DIM" "$C_RST"
+            pause; return
+        fi
+    fi
+
+    printf '  Создаю пользователя telemt... '
+    id telemt >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /opt/telemt telemt >/dev/null 2>&1
+    mkdir -p /opt/telemt /etc/telemt
+    chown -R telemt:telemt /opt/telemt /etc/telemt
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    printf '  Генерирую %s... ' "$TELEMT_CONF"
+    sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+        -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+        -e "s/__PORT__/$PROXY_PORT/g" \
+        -e "s/__API_PORT__/$PROXY_API_PORT/g" \
+        telemt.toml.template > "$TELEMT_CONF"
+    chown telemt:telemt "$TELEMT_CONF"
+    chmod 640 "$TELEMT_CONF"
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    printf '  Создаю systemd-сервис... '
+    cat > /etc/systemd/system/${TELEMT_SVC}.service <<EOF
+[Unit]
+Description=Telemt MTProto Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt
+Group=telemt
+WorkingDirectory=/opt/telemt
+ExecStart=${TELEMT_BIN} ${TELEMT_CONF}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    printf '  Запускаю telemt... '
+    systemctl enable "$TELEMT_SVC" >/dev/null 2>&1
+    systemctl restart "$TELEMT_SVC" >/dev/null 2>&1
+    local i=0
+    while (( i < 8 )); do
+        sleep 1; i=$((i+1)); printf '.'
     done
     printf '\n'
 
-    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproxy-caddy"; then
-        fail_inline "Caddy не запустился — проверь логи: $COMPOSE logs caddy"
+    if ! systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1; then
+        fail_inline "telemt не запустился"
+        printf '%s   Проверь логи: sudo proxy → 5%s\n' "$C_DIM" "$C_RST"
         pause; return
     fi
-    ok_inline "Caddy запущен (LE-сертификат для ${DOMAIN})"
+    ok_inline "telemt запущен"
 
-    # Запускаем alexbers — он заберёт длину cert у Caddy при старте
-    printf '  Запускаю alexbers... '
-    $COMPOSE up -d --build alexbers >/dev/null 2>&1
-    local j=0
-    while (( j < 10 )); do
-        sleep 1
-        j=$((j+1))
-        printf '.'
-    done
-    printf '\n'
-
-    if ! $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
-        fail_inline "alexbers не запустился"
-        printf '%s   Проверь логи: sudo proxy → 5) Логи alexbers%s\n' "$C_DIM" "$C_RST"
-        pause; return
-    fi
-    ok_inline "alexbers запущен"
-
-    local hex_domain link
-    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_domain}"
+    local hex_mask link
+    hex_mask=$(printf '%s' "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
-    printf '%sFakeTLS-ссылка:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
-
-    printf '%sЧто осталось вручную (для рекламы):%s\n' "$C_BLD" "$C_RST"
-    printf '  1. @MTProxybot → /newproxy\n'
-    printf '  2. Введи: %s:%s\n' "$DOMAIN" "$PROXY_PORT"
-    printf '  3. Введи секрет: %s\n' "$BASE_SECRET"
-    printf '  4. Сохрани AD_TAG из ответа бота\n'
-    printf '  5. /myproxies → выбери прокси → Set promoted channel → @канал\n'
-    printf '  6. Вернись сюда → Установить прокси, впиши AD_TAG\n'
+    printf '%sСсылка для пользователей:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
+    printf '%sНастройка безопасности:%s запусти пункт 3 (ufw, keepalive, rate-limit)\n' "$C_BLD" "$C_RST"
 
     pause
 }
@@ -659,11 +563,11 @@ action_security() {
     printf 'SSH-порт обнаружен: %s%s%s\n\n' "$C_BLD" "$SSH_PORT" "$C_RST"
     printf 'Будет:\n'
     printf '  • просканированы открытые порты\n'
-    printf '  • про каждый незнакомый порт спросим\n'
     printf '  • настроен файрвол ufw\n'
+    printf '  • на порт 443 добавлен iptables rate-limit (1 SYN/сек/IP)\n'
     printf '  • установлен fail2ban\n'
     printf '  • включены автообновления безопасности\n'
-    printf '  • применены sysctl-настройки\n\n'
+    printf '  • применены sysctl-настройки (TCP keepalive — фикс залипания iOS)\n\n'
 
     if ! confirm "Запустить?" Y; then
         return
@@ -673,7 +577,7 @@ action_security() {
     local listening_ports=()
     while IFS= read -r line; do
         local port
-        port=$(echo "$line" | awk '{print $4}' | awk -F: '{print $NF}')
+        port=$(printf '%s' "$line" | awk '{print $4}' | awk -F: '{print $NF}')
         [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && listening_ports+=("$port")
     done < <(ss -tln 2>/dev/null | tail -n +2)
 
@@ -682,12 +586,10 @@ action_security() {
         unique_ports=$(printf '%s\n' "${listening_ports[@]}" | sort -un)
     fi
 
-    local whitelist=("$SSH_PORT" 80 443 853)
+    local whitelist=("$SSH_PORT" 443)
     is_whitelisted() {
         local p="$1"
-        for wp in "${whitelist[@]}"; do
-            [[ "$p" == "$wp" ]] && return 0
-        done
+        for wp in "${whitelist[@]}"; do [[ "$p" == "$wp" ]] && return 0; done
         return 1
     }
 
@@ -698,8 +600,7 @@ action_security() {
             local proc=""
             proc=$(ss -tlnp 2>/dev/null | awk -v p=":$port " '$0 ~ p {for(i=1;i<=NF;i++) if($i ~ /users:/) print $i}' | head -1 || true)
             [[ -z "$proc" ]] && proc="(неизвестно)"
-            printf '\n%sПорт %s%s слушается процессом:\n' "$C_YLW" "$port" "$C_RST"
-            printf '  %s\n' "$proc"
+            printf '\n%sПорт %s%s слушается: %s\n' "$C_YLW" "$port" "$C_RST" "$proc"
             if confirm "Оставить открытым в файрволе?" Y; then
                 extra_open+=("$port")
             fi
@@ -713,12 +614,11 @@ action_security() {
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Устанавливаю ufw... '
-    if apt install -y ufw >/dev/null 2>&1; then
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '%sошибка (возможно apt занят)%s\n' "$C_RED" "$C_RST"
+    if ! apt install -y ufw >/dev/null 2>&1; then
+        fail_inline "apt не сработал"
         pause; return
     fi
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Сбрасываю старые правила... '
     ufw --force reset >/dev/null 2>&1 || true
@@ -728,22 +628,35 @@ action_security() {
 
     printf '  Открываю порты: '
     ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
-    ufw allow 80/tcp comment "ACME challenge" >/dev/null 2>&1 || true
-    ufw allow 443/tcp comment "Caddy HTTPS" >/dev/null 2>&1 || true
-    ufw allow 853/tcp comment "MTProto alexbers" >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment "MTProto telemt" >/dev/null 2>&1 || true
     for port in "${extra_open[@]:-}"; do
         [[ -z "$port" ]] && continue
         ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
     done
-    printf '%s%s 80 443 853%s' "$C_CYN" "$SSH_PORT" "$C_RST"
-    if [[ ${#extra_open[@]} -gt 0 ]]; then
-        printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
-    fi
+    printf '%s%s 443%s' "$C_CYN" "$SSH_PORT" "$C_RST"
+    [[ ${#extra_open[@]} -gt 0 ]] && printf ' %s+ %s%s' "$C_CYN" "${extra_open[*]}" "$C_RST"
     printf ' %sok%s\n' "$C_GRN" "$C_RST"
 
-    printf '  Активирую файрвол... '
+    printf '  Активирую ufw... '
     ufw --force enable >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # xt_recent: 1 SYN/сек на IP — надёжнее ufw limit против активного зондирования DPI
+    printf '  Добавляю iptables rate-limit на порт 443... '
+    if modprobe xt_recent 2>/dev/null; then
+        printf 'xt_recent '
+        iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP
+        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT
+        if command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sxt_recent недоступен — пропущено%s\n' "$C_YLW" "$C_RST"
+    fi
 
     printf '  Устанавливаю fail2ban... '
     if apt install -y fail2ban >/dev/null 2>&1; then
@@ -766,7 +679,7 @@ EOF
         systemctl restart fail2ban >/dev/null 2>&1 || true
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
-        printf '%sпропущено (apt не сработал)%s\n' "$C_YLW" "$C_RST"
+        printf '%sпропущено%s\n' "$C_YLW" "$C_RST"
     fi
 
     printf '  Настраиваю автообновления... '
@@ -776,22 +689,11 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-        cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-};
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "04:00";
-Unattended-Upgrade::Package-Blacklist {
-    "docker-ce";
-    "docker.io";
-};
-EOF
         systemctl enable unattended-upgrades >/dev/null 2>&1 || true
         systemctl restart unattended-upgrades >/dev/null 2>&1 || true
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
-        printf '%sпропущено (apt не сработал)%s\n' "$C_YLW" "$C_RST"
+        printf '%sпропущено%s\n' "$C_YLW" "$C_RST"
     fi
 
     printf '  Применяю sysctl-настройки... '
@@ -807,6 +709,12 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
+# TCP keepalive: быстро рвёт мёртвые соединения — фикс залипания iOS Telegram
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+# conntrack: сокращаем таймаут мёртвых established с 5 суток до 1 часа
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
 EOF
     sysctl --system >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
@@ -819,27 +727,16 @@ EOF
 
 action_status() {
     print_header
-    printf '%s═══ Статус контейнеров ═══%s\n\n' "$C_BLD" "$C_RST"
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        fail_inline "Docker не установлен"
-    else
-        $COMPOSE ps 2>&1 || true
-    fi
+    printf '%s═══ Статус сервиса telemt ═══%s\n\n' "$C_BLD" "$C_RST"
+    systemctl status "$TELEMT_SVC" --no-pager 2>&1 || true
     pause
 }
 
-action_logs_alexbers() {
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        print_header
-        fail_inline "Docker не установлен"
-        pause; return
-    fi
+action_logs() {
     print_header
-    printf '%s═══ Логи alexbers (live, Ctrl+C — выход) ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%s═══ Логи telemt (live, Ctrl+C — выход) ═══%s\n\n' "$C_BLD" "$C_RST"
     trap 'true' INT
-    $COMPOSE logs --tail 50 -f alexbers || true
+    journalctl -u "$TELEMT_SVC" --tail=50 -f 2>/dev/null || true
     trap - INT
     pause
 }
@@ -847,27 +744,22 @@ action_logs_alexbers() {
 action_restart() {
     print_header
     printf '%s═══ Перезапуск ═══%s\n\n' "$C_BLD" "$C_RST"
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        fail_inline "Docker не установлен"
-        pause; return
+    printf 'Перезапускаю telemt... '
+    systemctl restart "$TELEMT_SVC" >/dev/null 2>&1
+    sleep 2
+    if systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1; then
+        ok_inline "telemt запущен"
+    else
+        fail_inline "telemt не запустился — проверь логи (пункт 5)"
     fi
-    printf 'Перезапускаю контейнеры... '
-    $COMPOSE restart >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
     pause
 }
 
 action_stop() {
     print_header
     printf '%s═══ Остановка ═══%s\n\n' "$C_BLD" "$C_RST"
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        fail_inline "Docker не установлен"
-        pause; return
-    fi
-    printf 'Останавливаю всё... '
-    $COMPOSE down >/dev/null 2>&1
+    printf 'Останавливаю telemt... '
+    systemctl stop "$TELEMT_SVC" >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
     pause
 }
@@ -875,40 +767,40 @@ action_stop() {
 action_start() {
     print_header
     printf '%s═══ Запуск ═══%s\n\n' "$C_BLD" "$C_RST"
-    detect_compose
-    if [[ -z "$COMPOSE" ]]; then
-        fail_inline "Docker не установлен"
-        pause; return
+    printf 'Запускаю telemt... '
+    systemctl start "$TELEMT_SVC" >/dev/null 2>&1
+    sleep 2
+    if systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1; then
+        ok_inline "telemt запущен"
+    else
+        fail_inline "telemt не запустился — проверь логи (пункт 5)"
     fi
-    printf 'Запускаю всё... '
-    $COMPOSE up -d >/dev/null 2>&1
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
     pause
 }
 
 action_show_link() {
     print_header
-    printf '%s═══ FakeTLS-ссылка для пользователей ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%s═══ Ссылка для пользователей ═══%s\n\n' "$C_BLD" "$C_RST"
     if [[ ! -f .env ]]; then
         fail_inline ".env не найден. Сначала установи прокси."
         pause; return
     fi
 
-    local DOMAIN="" BASE_SECRET=""
+    local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
     # shellcheck source=/dev/null
     source .env
 
-    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" ]]; then
-        fail_inline "В .env нет DOMAIN или BASE_SECRET"
+    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" || -z "$TLS_DOMAIN" ]]; then
+        fail_inline "В .env нет DOMAIN, BASE_SECRET или TLS_DOMAIN"
         pause; return
     fi
 
-    local hex_domain link
-    hex_domain=$(echo -n "$DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_domain}"
+    local hex_mask link
+    hex_mask=$(printf '%s' "$TLS_DOMAIN" | xxd -ps | tr -d '\n')
+    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
 
     printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
-    printf '%sФормат: ee (FakeTLS) + секрет + домен-маска (%s), порт %s.%s\n' "$C_DIM" "$DOMAIN" "$PROXY_PORT" "$C_RST"
+    printf '%sМаска: %s (telemt скачает реальный cert этого сайта)%s\n' "$C_DIM" "$TLS_DOMAIN" "$C_RST"
     pause
 }
 
@@ -928,59 +820,40 @@ action_system_update() {
     if apt update >/dev/null 2>&1; then
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
-        printf '%sошибка%s\n' "$C_RED" "$C_RST"
-        printf '%s  Возможно apt занят (unattended-upgrades в фоне)%s\n' "$C_DIM" "$C_RST"
+        fail_inline "apt update завершился с ошибкой"
         pause; return
     fi
 
-    # Сколько пакетов готово к обновлению
     local upgradable=0
     upgradable=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c . || echo 0)
-
     if [[ "$upgradable" -eq 0 ]]; then
         printf '\n%s✓%s Все пакеты уже актуальны\n' "$C_GRN" "$C_RST"
         pause; return
     fi
 
     printf '  Доступно обновлений: %s%d%s\n\n' "$C_BLD" "$upgradable" "$C_RST"
-
     if ! confirm "Установить обновления?" Y; then
         return
     fi
 
-    printf '\n%sУстанавливаю обновления (вывод apt не подавляется):%s\n\n' "$C_BLD" "$C_RST"
+    printf '\n%sУстанавливаю обновления:%s\n\n' "$C_BLD" "$C_RST"
     DEBIAN_FRONTEND=noninteractive apt -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        upgrade || {
-        fail_inline "apt upgrade завершился с ошибкой"
-        pause; return
-    }
+        upgrade || { fail_inline "apt upgrade завершился с ошибкой"; pause; return; }
 
-    printf '\n  Удаляю неиспользуемые пакеты... '
     apt autoremove -y >/dev/null 2>&1 || true
-    apt autoclean >/dev/null 2>&1 || true
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
+    apt autoclean  >/dev/null 2>&1 || true
 
-    # Проверка нужен ли ребут
     if [[ -f /var/run/reboot-required ]]; then
-        printf '\n%s⚠%s Требуется перезагрузка (обновлено ядро или libc)\n' "$C_YLW" "$C_RST"
-        if [[ -f /var/run/reboot-required.pkgs ]]; then
-            printf '%s   Из-за обновления:%s\n' "$C_DIM" "$C_RST"
-            sed 's/^/     /' /var/run/reboot-required.pkgs
-        fi
-        printf '\n'
+        printf '\n%s⚠%s Требуется перезагрузка\n' "$C_YLW" "$C_RST"
         if confirm "Перезагрузить сейчас?" N; then
-            printf '%sПерезагрузка через 5 сек... (Ctrl+C — отмена)%s\n' "$C_YLW" "$C_RST"
-            sleep 5
-            systemctl reboot
-            exit 0
-        else
-            printf '%sПерезагрузи позже сам:%s sudo reboot\n' "$C_DIM" "$C_RST"
+            printf '%sПерезагрузка через 5 сек...%s\n' "$C_YLW" "$C_RST"
+            sleep 5; systemctl reboot; exit 0
         fi
     fi
 
-    printf '\n%s═══ Обновление системы завершено ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
+    printf '\n%s═══ Обновление завершено ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
     pause
 }
 
@@ -989,12 +862,9 @@ action_system_update() {
 action_install_shortcut() {
     print_header
     printf '%s═══ Установка команды proxy ═══%s\n\n' "$C_BLD" "$C_RST"
-    printf 'Создаст симлинк %s/usr/local/bin/proxy%s → %s\n' \
+    printf 'Создаст симлинк %s/usr/local/bin/proxy%s → %s\n\n' \
         "$C_BLD" "$C_RST" "${SCRIPT_DIR}/manage.sh"
-    printf 'После — можно запускать %ssudo proxy%s из любой папки.\n\n' "$C_BLD" "$C_RST"
-
     install_shortcut noisy
-
     pause
 }
 
@@ -1009,22 +879,16 @@ action_self_update() {
         pause; return
     fi
 
-    # Если есть локальные изменения — показать и предложить сбросить
     local local_changes
     local_changes=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)
     if [[ -n "$local_changes" ]]; then
         printf '%sНайдены локальные изменения:%s\n' "$C_YLW" "$C_RST"
-        echo "$local_changes" | sed 's/^/  /'
-        printf '\n%sТипично это правка прав файлов, окончаний строк (CRLF/LF) или ручные правки.%s\n' \
-            "$C_DIM" "$C_RST"
-        printf '%sСбросить и подтянуть свежую версию с GitHub?%s\n' "$C_BLD" "$C_RST"
-        if ! confirm "Сбросить локальные изменения" Y; then
+        printf '%s\n' "$local_changes" | sed 's/^/  /'
+        if ! confirm "Сбросить локальные изменения и подтянуть GitHub?" Y; then
             pause; return
         fi
-        printf 'Сбрасываю локальные изменения... '
         git -C "$SCRIPT_DIR" reset --hard HEAD >/dev/null 2>&1
         git -C "$SCRIPT_DIR" clean -fd >/dev/null 2>&1
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
 
     local before after
@@ -1032,15 +896,10 @@ action_self_update() {
 
     printf 'Получаю изменения... '
     if ! git -C "$SCRIPT_DIR" fetch origin --quiet 2>/dev/null; then
-        printf '%sошибка%s\n' "$C_RED" "$C_RST"
-        fail_inline "git fetch failed — проверь интернет/доступ к GitHub"
+        fail_inline "git fetch failed"
         pause; return
     fi
-    if ! git -C "$SCRIPT_DIR" reset --hard origin/main >/dev/null 2>&1; then
-        printf '%sошибка%s\n' "$C_RED" "$C_RST"
-        fail_inline "git reset failed"
-        pause; return
-    fi
+    git -C "$SCRIPT_DIR" reset --hard origin/main >/dev/null 2>&1
     after=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
@@ -1053,70 +912,31 @@ action_self_update() {
 
     local changed
     changed=$(git -C "$SCRIPT_DIR" diff --name-only "$before" "$after")
-
     printf '\n%sИзменённые файлы:%s\n' "$C_BLD" "$C_RST"
     printf '%s\n' "$changed" | sed 's/^/  /'
 
-    if printf '%s' "$changed" | grep -qE '^(docker-compose\.yml|config\.py\.template)$'; then
-        printf '\n%sИзменились шаблоны или compose.%s\n' "$C_YLW" "$C_RST"
-        if confirm "Перегенерировать конфиги и перезапустить контейнеры?" N; then
-            detect_compose
-            if [[ -n "$COMPOSE" && -f .env ]]; then
-                local DOMAIN="" BASE_SECRET="" AD_TAG=""
+    if printf '%s' "$changed" | grep -q 'telemt\.toml\.template'; then
+        printf '\n%sИзменился telemt.toml.template.%s\n' "$C_YLW" "$C_RST"
+        if confirm "Перегенерировать конфиг и перезапустить?" N; then
+            if [[ -f .env ]]; then
+                local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
                 # shellcheck source=/dev/null
                 source .env
-
-                # Генерируем Caddyfile если нет
-                if [[ ! -f Caddyfile ]]; then
-                    cat > Caddyfile <<CEOF
-${DOMAIN} {
-    respond "OK" 200
-    header Server "nginx"
-}
-CEOF
-                fi
-
-                # Обновляем config.py
-                if [[ -n "${AD_TAG:-}" ]]; then
-                    sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                        -e "s/__DOMAIN__/$DOMAIN/g" \
-                        -e "s/# AD_TAG = \"__AD_TAG__\"/AD_TAG = \"$AD_TAG\"/g" \
-                        config.py.template > config.py
-                else
-                    sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
-                        -e "s/__DOMAIN__/$DOMAIN/g" \
-                        config.py.template > config.py
-                fi
-                chmod 644 config.py
-
-                # Останавливаем всё
-                printf '  Останавливаю старые контейнеры... '
-                $COMPOSE down --remove-orphans >/dev/null 2>&1 || true
-                printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-                # Сначала Caddy (получает LE-сертификат)
-                printf '  Запускаю Caddy...'
-                $COMPOSE up -d caddy >/dev/null 2>&1
-                sleep 15
-                printf '\n'
-
-                printf '  Запускаю alexbers... '
-                $COMPOSE up -d --build alexbers >/dev/null 2>&1
-                sleep 8
-                if $COMPOSE ps --status running 2>/dev/null | grep -q "mtproto-final"; then
-                    ok_inline "alexbers запущен"
-                else
-                    fail_inline "alexbers не запустился — проверь логи (пункт 5)"
-                fi
+                sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
+                    -e "s/__TLS_DOMAIN__/${TLS_DOMAIN:-$TLS_MASK_DOMAIN}/g" \
+                    -e "s/__PORT__/$PROXY_PORT/g" \
+                    -e "s/__API_PORT__/$PROXY_API_PORT/g" \
+                    telemt.toml.template > "$TELEMT_CONF"
+                chown telemt:telemt "$TELEMT_CONF" 2>/dev/null || true
+                systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 || true
+                ok_inline "Конфиг обновлён, telemt перезапущен"
             fi
         fi
     fi
 
-    if printf '%s' "$changed" | grep -qE '^manage\.sh$'; then
-        printf '\n%sСам manage.sh обновился — перезапусти скрипт чтобы изменения применились.%s\n' "$C_YLW" "$C_RST"
-        pause
-        clear
-        exit 0
+    if printf '%s' "$changed" | grep -q '^manage\.sh$'; then
+        printf '\n%smanage.sh обновился — перезапусти скрипт.%s\n' "$C_YLW" "$C_RST"
+        pause; clear; exit 0
     fi
 
     pause
@@ -1127,142 +947,81 @@ CEOF
 action_uninstall() {
     print_header
     printf '%s═══ ПОЛНОЕ УДАЛЕНИЕ ═══%s\n\n' "$C_RED$C_BLD" "$C_RST"
-    printf 'Возврат VPS к состоянию ДО запуска этого скрипта.\n'
-    printf '%sDocker НЕ удаляется — он может использоваться другими сервисами.%s\n\n' "$C_DIM" "$C_RST"
-
-    printf '%sЭтап 1 — Прокси (обязательно):%s\n' "$C_BLD" "$C_RST"
-    printf '  • остановить контейнеры (mtproto-final и возможные старые nginx/certbot)\n'
-    printf '  • удалить Docker-образы собранные нами (alexbers)\n'
-    printf '  • удалить Docker network проекта\n'
-    printf '  • удалить config.py, .env\n'
-    printf '  • удалить папку src/ (исходник alexbers)\n\n'
+    printf 'Удалит telemt, сервис и конфиги с этого VPS.\n\n'
 
     if ! confirm "Удалить прокси?" Y; then
         return
     fi
 
-    # Опциональные этапы
     local revert_security=false
-    local remove_deps=false
+    printf '\n%sБезопасность (опционально):%s\n' "$C_BLD" "$C_RST"
+    printf '  • ufw — сбросить правила\n'
+    printf '  • fail2ban — выключить\n'
+    printf '  • sysctl-hardening — удалить\n'
+    confirm "Откатить настройки безопасности?" Y && revert_security=true
 
-    printf '\n%sЭтап 2 — Настройки безопасности (опционально):%s\n' "$C_BLD" "$C_RST"
-    printf '  • ufw — сбросить правила и отключить\n'
-    printf '  • fail2ban — выключить и удалить /etc/fail2ban/jail.local\n'
-    printf '  • unattended-upgrades — выключить\n'
-    printf '  • удалить /etc/sysctl.d/99-hardening.conf\n'
-    if confirm "Откатить настройки безопасности?" Y; then
-        revert_security=true
-    fi
+    printf '\n%sПриступаю...%s\n' "$C_BLD" "$C_RST"
 
-    printf '\n%sЭтап 3 — Зависимости скрипта (опционально):%s\n' "$C_BLD" "$C_RST"
-    printf '  • удалить пакеты установленные скриптом: dnsutils, xxd\n'
-    printf '  • %sможет помешать другим сервисам — обычно не стоит%s\n' "$C_DIM" "$C_RST"
-    if confirm "Удалить зависимости?" N; then
-        remove_deps=true
-    fi
+    printf '  Останавливаю telemt... '
+    systemctl stop    "$TELEMT_SVC" >/dev/null 2>&1 || true
+    systemctl disable "$TELEMT_SVC" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${TELEMT_SVC}.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    printf '\n%sПриступаю к удалению...%s\n' "$C_BLD" "$C_RST"
+    printf '  Удаляю бинарник и конфиги... '
+    rm -f "$TELEMT_BIN" "$TELEMT_CONF"
+    rm -rf /etc/telemt /opt/telemt
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # === ЭТАП 1: Контейнеры, образы, volumes, конфиги ===
-    detect_compose
-    if [[ -n "$COMPOSE" && -f docker-compose.yml ]]; then
-        printf '  Останавливаю контейнеры, удаляю образы... '
-        $COMPOSE down --rmi local --remove-orphans >/dev/null 2>&1 || true
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    fi
+    printf '  Удаляю .env и локальные конфиги... '
+    rm -f .env config.py Caddyfile
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # На случай если контейнеры остались (создавались вручную или compose выпал)
+    printf '  Убираю iptables rate-limit... '
+    iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
     if command -v docker >/dev/null 2>&1; then
         local stale
-        stale=$(docker ps -a \
-            --filter "name=mtproto-final" \
-            --filter "name=mtproxy-nginx" \
-            --filter "name=mtproxy-certbot" \
-            -q 2>/dev/null)
+        stale=$(docker ps -a --filter "name=mtproto-final" --filter "name=mtproxy-caddy" -q 2>/dev/null || true)
         if [[ -n "$stale" ]]; then
-            printf '  Удаляю осиротевшие контейнеры... '
+            printf '  Удаляю старые Docker-контейнеры... '
             # shellcheck disable=SC2086
             docker rm -f $stale >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
         fi
-
-        # Удаляем возможные старые volumes от nginx/certbot
-        local vols
-        vols=$(docker volume ls -q 2>/dev/null | grep -E '(my-mtproxy|mtproxy)_(certbot_certs|certbot_www|caddy_data|caddy_config)' || true)
-        if [[ -n "$vols" ]]; then
-            printf '  Удаляю старые volumes (certbot/caddy)... '
-            echo "$vols" | xargs -r docker volume rm >/dev/null 2>&1 || true
-            printf '%sok%s\n' "$C_GRN" "$C_RST"
-        fi
     fi
 
-    printf '  Удаляю конфиги и исходник... '
-    rm -f nginx.conf Caddyfile config.py .env
-    rm -rf src
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    # Удалить симлинк /usr/local/bin/proxy если он наш
     if [[ -L /usr/local/bin/proxy ]] && \
        [[ "$(readlink -f /usr/local/bin/proxy 2>/dev/null)" == "${SCRIPT_DIR}/manage.sh" ]]; then
-        printf '  Удаляю команду /usr/local/bin/proxy... '
         rm -f /usr/local/bin/proxy
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
 
-    # === ЭТАП 2: Безопасность ===
     if $revert_security; then
-        if command -v ufw >/dev/null 2>&1; then
+        command -v ufw >/dev/null 2>&1 && {
             printf '  Откатываю ufw... '
             ufw --force reset >/dev/null 2>&1 || true
             ufw --force disable >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
-        fi
-
-        if [[ -f /etc/fail2ban/jail.local ]]; then
+        }
+        [[ -f /etc/fail2ban/jail.local ]] && {
             printf '  Откатываю fail2ban... '
             rm -f /etc/fail2ban/jail.local
             systemctl stop fail2ban >/dev/null 2>&1 || true
             systemctl disable fail2ban >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
-        fi
-
-        if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] || [[ -f /etc/apt/apt.conf.d/50unattended-upgrades ]]; then
-            printf '  Откатываю автообновления... '
-            rm -f /etc/apt/apt.conf.d/20auto-upgrades
-            rm -f /etc/apt/apt.conf.d/50unattended-upgrades
-            systemctl stop unattended-upgrades >/dev/null 2>&1 || true
-            systemctl disable unattended-upgrades >/dev/null 2>&1 || true
-            printf '%sok%s\n' "$C_GRN" "$C_RST"
-        fi
-
-        if [[ -f /etc/sysctl.d/99-hardening.conf ]]; then
-            printf '  Откатываю sysctl-настройки... '
+        }
+        [[ -f /etc/sysctl.d/99-hardening.conf ]] && {
+            printf '  Откатываю sysctl... '
             rm -f /etc/sysctl.d/99-hardening.conf
             sysctl --system >/dev/null 2>&1 || true
             printf '%sok%s\n' "$C_GRN" "$C_RST"
-        fi
+        }
     fi
 
-    # === ЭТАП 3: Зависимости ===
-    if $remove_deps; then
-        printf '  Удаляю зависимости скрипта... '
-        apt remove -y dnsutils xxd >/dev/null 2>&1 || true
-        printf '%sok%s\n' "$C_GRN" "$C_RST"
-    fi
-
-    printf '\n%s═══ Удалено ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
-
-    # Сводка состояния
-    printf '%sСостояние VPS:%s\n' "$C_BLD" "$C_RST"
-    printf '  • Прокси, контейнеры, образы, volumes: %sудалены%s\n' "$C_GRN" "$C_RST"
-    if $revert_security; then
-        printf '  • Файрвол и hardening:                 %sоткачены%s\n' "$C_GRN" "$C_RST"
-    else
-        printf '  • Файрвол и hardening:                 %sсохранены%s\n' "$C_DIM" "$C_RST"
-    fi
-    printf '  • Docker:                              %sсохранён%s\n' "$C_DIM" "$C_RST"
-    printf '\n%sПапка скрипта (manage.sh, шаблоны) осталась — удали вручную если нужно:%s\n' "$C_DIM" "$C_RST"
-    printf '  cd .. && rm -rf %s\n' "$(basename "$SCRIPT_DIR")"
+    printf '\n%s═══ Удалено ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
     pause
 }
 
@@ -1272,26 +1031,26 @@ action_check_telegram() {
     print_header
     printf '%s═══ Проверка связи с Telegram ═══%s\n\n' "$C_BLD" "$C_RST"
 
-    # Читаем DOMAIN из .env
-    local DOMAIN=""
-    if [[ -f .env ]]; then
-        # shellcheck source=/dev/null
-        source .env 2>/dev/null || true
+    local TLS_DOMAIN=""
+    [[ -f .env ]] && { source .env 2>/dev/null || true; }
+
+    printf '%stellemt (порт %s):%s\n' "$C_BLD" "$PROXY_PORT" "$C_RST"
+    if timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/${PROXY_PORT}" 2>/dev/null; then
+        printf '  %s✓ 127.0.0.1:%s доступен — telemt слушает%s\n\n' "$C_GRN" "$PROXY_PORT" "$C_RST"
+    else
+        printf '  %s✗ 127.0.0.1:%s НЕДОСТУПЕН — telemt не запущен!%s\n' "$C_RED" "$PROXY_PORT" "$C_RST"
+        printf '  %sЗапусти прокси (пункт 8)%s\n\n' "$C_DIM" "$C_RST"
     fi
 
-    # Проверяем Caddy (HTTPS на 443 для собственного домена)
-    if [[ -n "$DOMAIN" ]]; then
-        printf '%sCaddy / FakeTLS-маскировка (домен = %s):%s\n' "$C_BLD" "$DOMAIN" "$C_RST"
-        if timeout 5 bash -c "echo >/dev/tcp/${DOMAIN}/443" 2>/dev/null; then
-            printf '  %s✓ %s:443 доступен — Caddy слушает, FakeTLS работает%s\n\n' "$C_GRN" "$DOMAIN" "$C_RST"
-        else
-            printf '  %s✗ %s:443 НЕДОСТУПЕН — Caddy не запущен или порт закрыт!%s\n' "$C_RED" "$DOMAIN" "$C_RST"
-            printf '  %sAlexbers не сможет получить длину cert → клиенты не подключатся.%s\n' "$C_DIM" "$C_RST"
-            printf '  %sПроверь: docker compose logs caddy%s\n\n' "$C_DIM" "$C_RST"
-        fi
+    local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
+    printf '%sTLS-маска (%s):%s\n' "$C_BLD" "$mask" "$C_RST"
+    if timeout 5 bash -c "echo >/dev/tcp/${mask}/443" 2>/dev/null; then
+        printf '  %s✓ %s:443 доступен — telemt скачает реальный cert%s\n\n' "$C_GRN" "$mask" "$C_RST"
+    else
+        printf '  %s✗ %s:443 НЕДОСТУПЕН — смени маску, запусти деплой заново%s\n\n' "$C_RED" "$mask" "$C_RST"
     fi
 
-    printf 'Проверяю TCP-доступность датацентров Telegram с этого сервера...\n\n'
+    printf 'Проверяю TCP-доступность датацентров Telegram...\n\n'
 
     local -a dc_list=("DC1:149.154.175.50" "DC2:149.154.167.51" "DC3:149.154.175.100" "DC4:149.154.167.91" "DC5:149.154.171.5")
     local -a ports=(443 8888)
@@ -1302,8 +1061,7 @@ action_check_telegram() {
     printf '  %s─────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
 
     for entry in "${dc_list[@]}"; do
-        local dc="${entry%%:*}"
-        local ip="${entry##*:}"
+        local dc="${entry%%:*}" ip="${entry##*:}"
         printf '  %s%-5s%s %-20s' "$C_BLD" "$dc" "$C_RST" "(${ip})"
         local dc_ok=false
         for port in "${ports[@]}"; do
@@ -1316,32 +1074,53 @@ action_check_telegram() {
             fi
         done
         printf '\n'
-        if $dc_ok; then
-            ok_count=$((ok_count+1))
-        else
-            fail_count=$((fail_count+1))
-        fi
+        $dc_ok && ok_count=$((ok_count+1)) || fail_count=$((fail_count+1))
     done
 
     printf '\n'
-
-    # Итог по порту 443 (основной)
-    if (( fail_count == 0 )); then
-        printf '%s✓ Все DC доступны по порту 443 — прямое подключение работает%s\n' "$C_GRN" "$C_RST"
-    elif (( ok_count == 0 )); then
-        printf '%s✗ Ни один DC Telegram недоступен по порту 443%s\n' "$C_RED" "$C_RST"
-        printf '%s  Возможно, сервер заблокирован Telegram или нет интернета.%s\n' "$C_DIM" "$C_RST"
+    if   (( fail_count == 0 )); then
+        printf '%s✓ Все DC доступны по порту 443%s\n' "$C_GRN" "$C_RST"
+    elif (( ok_count   == 0 )); then
+        printf '%s✗ Ни один DC Telegram недоступен по 443%s\n' "$C_RED" "$C_RST"
     else
         printf '%s⚠ Часть DC недоступна по 443 (%d из 5)%s\n' "$C_YLW" "$ok_count" "$C_RST"
     fi
 
-    # Итог по порту 8888 (middle proxy)
     if (( middle_fail > 0 )); then
-        printf '\n%s⚠ Middle proxy (порт 8888): %d из 5 DC недоступны%s\n' "$C_YLW" "$middle_fail" "$C_RST"
-        printf '%s  USE_MIDDLE_PROXY=False в config.py правильное решение.%s\n' "$C_DIM" "$C_RST"
-        printf '%s  AD_TAG при этом зарегистрирован, но реклама показываться не будет.%s\n' "$C_DIM" "$C_RST"
+        printf '\n%s⚠ Middle proxy (8888): %d из 5 DC недоступны — USE_MIDDLE_PROXY=false правильно%s\n' \
+            "$C_YLW" "$middle_fail" "$C_RST"
+    fi
+
+    pause
+}
+
+# ============ ACTIONS: UPDATE TELEMT BINARY ============
+
+action_update_telemt() {
+    print_header
+    printf '%s═══ Обновление бинарника telemt ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    local cur_ver=""
+    [[ -x "$TELEMT_BIN" ]] && cur_ver=$("$TELEMT_BIN" --version 2>/dev/null | head -1 || echo "?")
+    printf 'Текущая версия: %s%s%s\n\n' "$C_BLD" "${cur_ver:-(не установлен)}" "$C_RST"
+
+    if ! confirm "Скачать и установить последнюю версию?" Y; then
+        return
+    fi
+
+    printf '  Скачиваю telemt... '
+    if install_telemt_binary; then
+        local new_ver
+        new_ver=$("$TELEMT_BIN" --version 2>/dev/null | head -1 || echo "ok")
+        printf '%sok%s (%s)\n' "$C_GRN" "$C_RST" "$new_ver"
+        printf '  Перезапускаю сервис... '
+        systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 || true
+        sleep 2
+        systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1 \
+            && ok_inline "telemt запущен" \
+            || fail_inline "telemt не запустился — проверь логи (пункт 5)"
     else
-        printf '%s✓ Middle proxy (порт 8888): все DC доступны%s\n' "$C_GRN" "$C_RST"
+        fail_inline "Не удалось скачать"
     fi
 
     pause
@@ -1366,7 +1145,7 @@ main() {
             2)  action_deploy ;;
             3)  action_security ;;
             4)  action_status ;;
-            5)  action_logs_alexbers ;;
+            5)  action_logs ;;
             6)  action_restart ;;
             7)  action_stop ;;
             8)  action_start ;;
@@ -1376,8 +1155,9 @@ main() {
             12) action_install_shortcut ;;
             13) action_uninstall ;;
             14) action_check_telegram ;;
+            15) action_update_telemt ;;
             0|q|Q|exit|"") clear; exit 0 ;;
-            *)  printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
+            *) printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
     done
 }

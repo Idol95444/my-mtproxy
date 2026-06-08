@@ -1,0 +1,37 @@
+[general]
+fast_mode = true
+use_middle_proxy = false
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[network]
+ipv4 = true
+ipv6 = false
+prefer = 4
+
+[server]
+port = __PORT__
+listen_addr_ipv4 = "0.0.0.0"
+client_mss = "tspu"
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:__API_PORT__"
+whitelist = ["127.0.0.1/32"]
+
+[censorship]
+tls_domain = "__TLS_DOMAIN__"
+mask = true
+mask_port = 443
+tls_emulation = true
+unknown_sni_action = "reject_handshake"
+
+[access]
+replay_check_len = 65536
+ignore_time_skew = false
+
+[access.users]
+user1 = "__BASE_SECRET__"
