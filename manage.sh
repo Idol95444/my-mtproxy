@@ -324,7 +324,6 @@ ${C_BLD}═══ УПРАВЛЕНИЕ ═══${C_RST}
   ${C_CYN}7)${C_RST} Остановить прокси
   ${C_CYN}8)${C_RST} Запустить прокси
   ${C_CYN}9)${C_RST} Показать ссылку для пользователей
-  ${C_CYN}17)${C_RST} Статистика и аудит           ${C_DIM}(соединения, IP, трафик, гео)${C_RST}
 
 ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}10)${C_RST} Обновить систему              ${C_DIM}(apt update && upgrade)${C_RST}
@@ -334,6 +333,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/8888)${C_RST}
   ${C_CYN}15)${C_RST} Обновить telemt              ${C_DIM}(скачать последнюю версию)${C_RST}
   ${C_CYN}16)${C_RST} Задать AD_TAG               ${C_DIM}(спонсорский канал, без перезапуска)${C_RST}
+  ${C_CYN}17)${C_RST} Статистика и аудит           ${C_DIM}(соединения, IP, трафик, гео)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -1225,10 +1225,10 @@ action_stats() {
         pause; return
     fi
 
-    printf '%s' "$api_data" | python3 - <<'PYEOF'
-import sys, json
+    API_JSON="$api_data" python3 - <<'PYEOF'
+import json, os
 
-data = json.load(sys.stdin)
+data = json.loads(os.environ['API_JSON'])
 users = data['data']
 total_conns = sum(u.get('current_connections', 0) for u in users)
 total_ips   = sum(u.get('active_unique_ips', 0) for u in users)
@@ -1278,9 +1278,9 @@ print(d.get('country','?'), d.get('city','?'), org)
 
     if [[ -f "$AUDIT_LOG" ]]; then
         printf '\n%sИстория (последние 8 снапшотов):%s\n' "$C_BLD" "$C_RST"
-        tail -8 "$AUDIT_LOG" | python3 - <<'PYEOF'
-import sys, json
-for line in sys.stdin:
+        AUDIT_LINES="$(tail -8 "$AUDIT_LOG")" python3 - <<'PYEOF'
+import json, os
+for line in os.environ['AUDIT_LINES'].splitlines():
     try:
         d = json.loads(line.strip())
         ts = d.get('ts', '')[:16]
