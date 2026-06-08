@@ -556,12 +556,14 @@ EOF
             || printf '%sпропущено (проверь пункт 16)%s\n' "$C_YLW" "$C_RST"
     fi
 
-    local hex_mask link
+    local hex_mask link_ee link_dd
     hex_mask=$(printf '%s' "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
+    link_ee="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
+    link_dd="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=dd${BASE_SECRET}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
-    printf '%sСсылка для пользователей:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
+    printf '%sОсновная ссылка (FakeTLS):%s\n%s\n\n' "$C_BLD" "$C_RST" "$link_ee"
+    printf '%sДля пользователей с VPN (VLESS и др.):%s\n%s\n\n' "$C_BLD" "$C_RST" "$link_dd"
     printf '%sНастройка безопасности:%s запусти пункт 3 (ufw, keepalive, rate-limit)\n' "$C_BLD" "$C_RST"
     [[ -z "${AD_TAG:-}" ]] && printf '%sСпонсорский канал:%s запусти пункт 16 (AD_TAG)\n' "$C_BLD" "$C_RST"
 
@@ -811,12 +813,18 @@ action_show_link() {
         pause; return
     fi
 
-    local hex_mask link
+    local hex_mask link_ee link_dd
     hex_mask=$(printf '%s' "$TLS_DOMAIN" | xxd -ps | tr -d '\n')
-    link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
+    link_ee="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
+    link_dd="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=dd${BASE_SECRET}"
 
-    printf '%s%s%s\n\n' "$C_BLD" "$link" "$C_RST"
-    printf '%sМаска: %s (telemt скачает реальный cert этого сайта)%s\n' "$C_DIM" "$TLS_DOMAIN" "$C_RST"
+    printf '%sОсновная (FakeTLS, рекомендуется):%s\n' "$C_BLD" "$C_RST"
+    printf '%s%s%s\n\n' "$C_GRN" "$link_ee" "$C_RST"
+
+    printf '%sДля пользователей с VPN (VLESS и др.):%s\n' "$C_BLD" "$C_RST"
+    printf '%s%s%s\n\n' "$C_CYN" "$link_dd" "$C_RST"
+
+    printf '%sМаска ee: %s | dd-режим работает с любым VPN-клиентом%s\n' "$C_DIM" "$TLS_DOMAIN" "$C_RST"
     pause
 }
 
