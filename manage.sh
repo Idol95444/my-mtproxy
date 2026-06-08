@@ -52,6 +52,7 @@ ensure_deps() {
     command -v dig     >/dev/null 2>&1 || need+=(dnsutils)
     command -v git     >/dev/null 2>&1 || need+=(git)
     command -v curl    >/dev/null 2>&1 || need+=(curl)
+    command -v python3 >/dev/null 2>&1 || need+=(python3)
     if [[ ${#need[@]} -gt 0 ]]; then
         printf '%sУстанавливаю зависимости: %s%s\n' "$C_DIM" "${need[*]}" "$C_RST"
         apt update >/dev/null 2>&1
@@ -542,6 +543,19 @@ EOF
     fi
     ok_inline "telemt запущен"
 
+    local AD_TAG=""
+    [[ -f .env ]] && { source .env 2>/dev/null || true; }
+    if [[ -n "${AD_TAG:-}" ]]; then
+        printf '  Применяю AD_TAG из .env... '
+        local tag_result
+        tag_result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_ad_tag\":\"${AD_TAG}\"}" 2>/dev/null || true)
+        printf '%s' "$tag_result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null \
+            && ok_inline "AD_TAG применён" \
+            || printf '%sпропущено (проверь пункт 16)%s\n' "$C_YLW" "$C_RST"
+    fi
+
     local hex_mask link
     hex_mask=$(printf '%s' "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
     link="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
@@ -549,6 +563,7 @@ EOF
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
     printf '%sСсылка для пользователей:%s\n%s\n\n' "$C_BLD" "$C_RST" "$link"
     printf '%sНастройка безопасности:%s запусти пункт 3 (ufw, keepalive, rate-limit)\n' "$C_BLD" "$C_RST"
+    [[ -z "${AD_TAG:-}" ]] && printf '%sСпонсорский канал:%s запусти пункт 16 (AD_TAG)\n' "$C_BLD" "$C_RST"
 
     pause
 }
@@ -931,6 +946,15 @@ action_self_update() {
                 chown telemt:telemt "$TELEMT_CONF" 2>/dev/null || true
                 systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 || true
                 ok_inline "Конфиг обновлён, telemt перезапущен"
+                local AD_TAG=""
+                source .env 2>/dev/null || true
+                if [[ -n "${AD_TAG:-}" ]]; then
+                    sleep 3
+                    curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"user_ad_tag\":\"${AD_TAG}\"}" >/dev/null 2>&1 || true
+                    ok_inline "AD_TAG восстановлен"
+                fi
             fi
         fi
     fi
@@ -1088,7 +1112,7 @@ action_check_telegram() {
     fi
 
     if (( middle_fail > 0 )); then
-        printf '\n%s⚠ Middle proxy (8888): %d из 5 DC недоступны — USE_MIDDLE_PROXY=false правильно%s\n' \
+        printf '\n%s⚠ Middle proxy (8888): %d из 5 DC недоступны — AD_TAG и спонсорский канал могут не работать%s\n' \
             "$C_YLW" "$middle_fail" "$C_RST"
     fi
 
@@ -1154,10 +1178,15 @@ action_set_adtag() {
     fi
 
     printf '  Применяю через API... '
-    local result
+    local payload result
+    if [[ -n "$new_tag" ]]; then
+        payload="{\"user_ad_tag\":\"${new_tag}\"}"
+    else
+        payload='{"user_ad_tag":null}'
+    fi
     result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
         -H "Content-Type: application/json" \
-        -d "{\"user_ad_tag\":${new_tag:+\"$new_tag\"}${new_tag:-null}}" 2>/dev/null || true)
+        -d "$payload" 2>/dev/null || true)
 
     if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
         ok_inline "Применено без перезапуска"
