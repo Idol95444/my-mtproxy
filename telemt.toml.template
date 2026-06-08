@@ -35,3 +35,6 @@ ignore_time_skew = false
 
 [access.users]
 user1 = "__BASE_SECRET__"
+
+[access.user_ad_tags]
+user1 = "__AD_TAG__"

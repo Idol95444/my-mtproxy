@@ -329,6 +329,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}13)${C_RST} Удалить прокси
   ${C_CYN}14)${C_RST} Проверить связь с Telegram    ${C_DIM}(DC-серверы, порты 443/8888)${C_RST}
   ${C_CYN}15)${C_RST} Обновить telemt              ${C_DIM}(скачать последнюю версию)${C_RST}
+  ${C_CYN}16)${C_RST} Задать AD_TAG               ${C_DIM}(спонсорский канал, без перезапуска)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -1126,6 +1127,50 @@ action_update_telemt() {
     pause
 }
 
+action_set_adtag() {
+    print_header
+    printf '%s═══ AD_TAG (спонсорский канал) ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    local AD_TAG=""
+    [[ -f .env ]] && { source .env 2>/dev/null || true; }
+
+    local cur_tag=""
+    cur_tag=$(curl -s "http://127.0.0.1:${PROXY_API_PORT}/v1/users" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(d[0].get('user_ad_tag') or '')" 2>/dev/null || true)
+
+    if [[ -n "$cur_tag" ]]; then
+        printf 'Текущий тег: %s%s%s\n\n' "$C_BLD" "$cur_tag" "$C_RST"
+    else
+        printf 'Текущий тег: %sне задан%s\n\n' "$C_DIM" "$C_RST"
+    fi
+
+    printf '%sПолучи тег в @MTProxybot → /newproxy%s\n\n' "$C_DIM" "$C_RST"
+    local new_tag
+    new_tag=$(prompt_value "Новый AD_TAG (32 hex, пусто — очистить)" "${AD_TAG}")
+
+    if [[ -n "$new_tag" ]] && ! [[ "$new_tag" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        fail_inline "Неверный формат: нужно ровно 32 hex-символа"
+        pause; return
+    fi
+
+    printf '  Применяю через API... '
+    local result
+    result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_ad_tag\":${new_tag:+\"$new_tag\"}${new_tag:-null}}" 2>/dev/null || true)
+
+    if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+        ok_inline "Применено без перезапуска"
+        sed -i "s/^AD_TAG=.*/AD_TAG=${new_tag}/" .env 2>/dev/null || true
+        [[ -z "$(grep '^AD_TAG=' .env 2>/dev/null)" ]] && printf '\nAD_TAG=%s\n' "$new_tag" >> .env || true
+    else
+        fail_inline "API вернул ошибку"
+        printf '%s%s%s\n' "$C_DIM" "$result" "$C_RST"
+    fi
+
+    pause
+}
+
 # ============ MAIN ============
 
 main() {
@@ -1156,6 +1201,7 @@ main() {
             13) action_uninstall ;;
             14) action_check_telegram ;;
             15) action_update_telemt ;;
+            16) action_set_adtag ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *) printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
