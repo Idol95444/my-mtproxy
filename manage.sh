@@ -335,6 +335,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}16)${C_RST} Задать AD_TAG               ${C_DIM}(спонсорский канал, без перезапуска)${C_RST}
   ${C_CYN}17)${C_RST} Статистика и аудит           ${C_DIM}(соединения, IP, трафик, гео)${C_RST}
   ${C_CYN}18)${C_RST} Пользователи                 ${C_DIM}(добавить, ссылка, квота, удалить)${C_RST}
+  ${C_CYN}19)${C_RST} Telegram-бот                 ${C_DIM}(установить, запустить, настроить)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -1318,6 +1319,138 @@ PYEOF
     pause
 }
 
+# ============ ACTIONS: TELEGRAM BOT ============
+
+BOT_SVC="mtproxy-bot"
+BOT_SCRIPT="${SCRIPT_DIR}/tgbot.py"
+
+action_bot() {
+    print_header
+    printf '%s═══ Telegram-бот управления ═══%s\n\n' "$C_BLD" "$C_RST"
+
+    local BOT_TOKEN="" BOT_CHAT_ID=""
+    [[ -f .env ]] && source .env 2>/dev/null || true
+
+    # Status
+    if systemctl is-active "$BOT_SVC" >/dev/null 2>&1; then
+        printf '  Статус бота: %s● запущен%s\n' "$C_GRN" "$C_RST"
+    elif systemctl is-enabled "$BOT_SVC" >/dev/null 2>&1; then
+        printf '  Статус бота: %s○ установлен, не запущен%s\n' "$C_YLW" "$C_RST"
+    else
+        printf '  Статус бота: %sне установлен%s\n' "$C_DIM" "$C_RST"
+    fi
+    [[ -n "${BOT_TOKEN:-}" ]] && printf '  BOT_TOKEN:   %s...%s\n' "${BOT_TOKEN:0:8}" "$C_RST" \
+                               || printf '  BOT_TOKEN:   %sне задан%s\n' "$C_DIM" "$C_RST"
+    [[ -n "${BOT_CHAT_ID:-}" ]] && printf '  CHAT_ID:     %s\n' "$BOT_CHAT_ID" \
+                                 || printf '  CHAT_ID:     %sне задан%s\n' "$C_DIM" "$C_RST"
+    printf '\n'
+
+    printf '  %s1)%s Установить / обновить бота\n' "$C_CYN" "$C_RST"
+    printf '  %s2)%s Запустить\n' "$C_CYN" "$C_RST"
+    printf '  %s3)%s Остановить\n' "$C_CYN" "$C_RST"
+    printf '  %s4)%s Логи бота\n' "$C_CYN" "$C_RST"
+    printf '  %s5)%s Задать BOT_TOKEN и CHAT_ID\n' "$C_CYN" "$C_RST"
+    printf '  %s0)%s Назад\n' "$C_DIM" "$C_RST"
+    printf 'Выбор: '
+    local sub; read -r sub </dev/tty || return
+    case "$sub" in
+        1) _bot_install ;;
+        2) systemctl start  "$BOT_SVC" >/dev/null 2>&1 && ok_inline "Запущен"  || fail_inline "Ошибка"; sleep 2 ;;
+        3) systemctl stop   "$BOT_SVC" >/dev/null 2>&1 && ok_inline "Остановлен" || fail_inline "Ошибка"; sleep 2 ;;
+        4) journalctl -u "$BOT_SVC" -n 50 --no-pager 2>/dev/null; pause ;;
+        5) _bot_set_credentials ;;
+        0|"") return ;;
+    esac
+    action_bot
+}
+
+_bot_set_credentials() {
+    printf '\n%s─── Настройка бота ───%s\n\n' "$C_BLD" "$C_RST"
+    printf '  1. Создай бота через @BotFather → /newbot\n'
+    printf '  2. Скопируй токен (формат: 123456:ABCdef...)\n'
+    printf '  3. Узнай свой chat_id: напиши @userinfobot\n\n'
+
+    local token chat_id
+    token=$(prompt_value    "BOT_TOKEN (токен бота)" "${BOT_TOKEN:-}")
+    chat_id=$(prompt_value  "BOT_CHAT_ID (твой chat_id, можно несколько через запятую)" "${BOT_CHAT_ID:-}")
+
+    if [[ -z "$token" ]]; then
+        fail_inline "Токен не может быть пустым"; sleep 2; return
+    fi
+
+    # Update .env
+    if grep -q "^BOT_TOKEN=" .env 2>/dev/null; then
+        sed -i "s|^BOT_TOKEN=.*|BOT_TOKEN=${token}|" .env
+    else
+        printf 'BOT_TOKEN=%s\n' "$token" >> .env
+    fi
+    if grep -q "^BOT_CHAT_ID=" .env 2>/dev/null; then
+        sed -i "s|^BOT_CHAT_ID=.*|BOT_CHAT_ID=${chat_id}|" .env
+    else
+        printf 'BOT_CHAT_ID=%s\n' "$chat_id" >> .env
+    fi
+
+    ok_inline "Сохранено в .env"
+    if systemctl is-active "$BOT_SVC" >/dev/null 2>&1; then
+        printf '  Перезапускаю бота... '
+        systemctl restart "$BOT_SVC" >/dev/null 2>&1 && ok_inline "Перезапущен"
+    fi
+    sleep 2
+}
+
+_bot_install() {
+    printf '\n%s─── Установка бота ───%s\n\n' "$C_BLD" "$C_RST"
+
+    local BOT_TOKEN="" BOT_CHAT_ID=""
+    [[ -f .env ]] && source .env 2>/dev/null || true
+
+    if [[ -z "${BOT_TOKEN:-}" ]]; then
+        printf '%sСначала задай BOT_TOKEN (пункт 5)%s\n' "$C_YLW" "$C_RST"
+        pause; return
+    fi
+
+    if [[ ! -f "$BOT_SCRIPT" ]]; then
+        fail_inline "tgbot.py не найден — обнови скрипт из git (пункт 11)"; sleep 2; return
+    fi
+
+    chmod +x "$BOT_SCRIPT"
+
+    printf '  Создаю systemd-сервис... '
+    cat > "/etc/systemd/system/${BOT_SVC}.service" <<EOF
+[Unit]
+Description=MTProxy Telegram Bot
+After=network-online.target telemt.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${BOT_SCRIPT}
+WorkingDirectory=${SCRIPT_DIR}
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    printf '  Запускаю... '
+    systemctl enable "$BOT_SVC" >/dev/null 2>&1
+    systemctl restart "$BOT_SVC" >/dev/null 2>&1
+    sleep 3
+    if systemctl is-active "$BOT_SVC" >/dev/null 2>&1; then
+        ok_inline "Бот запущен и добавлен в автозапуск"
+        printf '\n  %sНапиши /help боту чтобы проверить%s\n' "$C_DIM" "$C_RST"
+    else
+        fail_inline "Бот не запустился"
+        printf '%s' "$(journalctl -u "$BOT_SVC" -n 10 --no-pager 2>/dev/null)"
+    fi
+    pause
+}
+
 # ============ ACTIONS: USER MANAGEMENT ============
 
 _users_print_table() {
@@ -1566,6 +1699,7 @@ main() {
             16) action_set_adtag ;;
             17) action_stats ;;
             18) action_manage_users ;;
+            19) action_bot ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *) printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
