@@ -334,6 +334,7 @@ ${C_BLD}═══ ОБСЛУЖИВАНИЕ ═══${C_RST}
   ${C_CYN}15)${C_RST} Обновить telemt              ${C_DIM}(скачать последнюю версию)${C_RST}
   ${C_CYN}16)${C_RST} Задать AD_TAG               ${C_DIM}(спонсорский канал, без перезапуска)${C_RST}
   ${C_CYN}17)${C_RST} Статистика и аудит           ${C_DIM}(соединения, IP, трафик, гео)${C_RST}
+  ${C_CYN}18)${C_RST} Пользователи                 ${C_DIM}(добавить, ссылка, квота, удалить)${C_RST}
 
   ${C_DIM}0) Выход${C_RST}
 
@@ -401,7 +402,7 @@ action_deploy() {
         source .env 2>/dev/null || true
     fi
 
-    step "1/3" "Домен (A-запись должна указывать на этот VPS)"
+    step "1/4" "Домен (A-запись должна указывать на этот VPS)"
     DOMAIN=$(prompt_value "Введи домен" "$DOMAIN")
     if [[ -z "$DOMAIN" ]]; then
         fail_inline "DOMAIN не может быть пустым"
@@ -409,7 +410,7 @@ action_deploy() {
     fi
     printf '\n'
 
-    step "2/3" "Базовый секрет (32 hex-символа, пусто — сгенерирую)"
+    step "2/4" "Базовый секрет (32 hex-символа, пусто — сгенерирую)"
     BASE_SECRET=$(prompt_value "Секрет" "$BASE_SECRET")
     if [[ -z "$BASE_SECRET" ]]; then
         BASE_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
@@ -420,7 +421,7 @@ action_deploy() {
     fi
     printf '\n'
 
-    step "3/3" "TLS-маскировочный домен (CDN, который telemt будет имитировать)"
+    step "3/4" "TLS-маскировочный домен (CDN, который telemt будет имитировать)"
     printf '       Telemt скачает реальный сертификат этого сайта.\n'
     printf '       Ищу доступный с этого VPS...\n'
     if detect_tls_domain noisy; then
@@ -429,6 +430,21 @@ action_deploy() {
         fail_inline "Ни один CDN-домен недоступен с этого VPS — нет исходящего HTTPS?"
         pause; return
     fi
+    printf '\n'
+
+    step "4/4" "Спонсорский канал (AD_TAG, пусто — пропустить)"
+    printf '       Получить тег: @MTProxybot → /newproxy → скопируй тег\n'
+    local NEW_AD_TAG
+    NEW_AD_TAG=$(prompt_value "AD_TAG (32 hex)" "${AD_TAG:-}")
+    if [[ -n "$NEW_AD_TAG" ]] && ! [[ "$NEW_AD_TAG" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        fail_inline "AD_TAG должен быть ровно 32 hex-символа — пропускаю"
+        NEW_AD_TAG=""
+    elif [[ -n "$NEW_AD_TAG" ]]; then
+        ok_inline "AD_TAG принят"
+    else
+        printf '  %sПропущено — можно задать позже в пункте 16%s\n' "$C_DIM" "$C_RST"
+    fi
+    AD_TAG="${NEW_AD_TAG}"
     printf '\n'
 
     if ! check_dns_health "$DOMAIN"; then
@@ -443,7 +459,9 @@ action_deploy() {
     printf '  Секрет:     %s\n' "$BASE_SECRET"
     printf '  TLS-маска:  %s\n' "$TLS_MASK_DOMAIN"
     printf '  Порт:       %s\n' "$PROXY_PORT"
-    printf '  client_mss: tspu (обход DPI ТСПУ)\n\n'
+    printf '  client_mss: tspu (обход DPI ТСПУ)\n'
+    [[ -n "${AD_TAG:-}" ]] && printf '  AD_TAG:     %s\n' "$AD_TAG"
+    printf '\n'
 
     if ! confirm "Запустить установку?" Y; then
         return
@@ -454,6 +472,7 @@ DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
 TLS_DOMAIN=$TLS_MASK_DOMAIN
 EOF
+    [[ -n "${AD_TAG:-}" ]] && printf 'AD_TAG=%s\n' "$AD_TAG" >> .env
     chmod 600 .env
 
     printf '\n%sУстановка:%s\n' "$C_BLD" "$C_RST"
@@ -1299,6 +1318,221 @@ PYEOF
     pause
 }
 
+# ============ ACTIONS: USER MANAGEMENT ============
+
+_users_print_table() {
+    API_JSON="$1" python3 - <<'PYEOF'
+import json, os
+data = json.loads(os.environ['API_JSON'])
+users = data['data']
+print(f"  {'#':<3} {'Имя':<12} {'Статус':<8} {'Соед':>5} {'IP':>4} {'Трафик':>8}  Квота / Срок")
+print(f"  {'─'*62}")
+for i, u in enumerate(users, 1):
+    status = "✓ вкл" if u.get('enabled', True) else "✗ выкл"
+    tb = u.get('total_octets', 0) / 1024**3
+    c  = u.get('current_connections', 0)
+    ip = u.get('active_unique_ips', 0)
+    quota = u.get('data_quota_bytes')
+    quota_str = f"{quota/1024**3:.0f}ГБ" if quota else "—"
+    exp = (u.get('expiration_rfc3339') or '')[:10] or '—'
+    print(f"  {i:<3} {u['username']:<12} {status:<8} {c:>5} {ip:>4} {tb:>7.2f}ГБ  {quota_str} / {exp}")
+PYEOF
+}
+
+_users_add() {
+    printf '\n%s─── Добавить пользователя ───%s\n\n' "$C_BLD" "$C_RST"
+    local name
+    name=$(prompt_value "Имя (a-z, 0-9, _)" "")
+    if [[ -z "$name" ]] || ! [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        fail_inline "Некорректное имя"; sleep 2; return
+    fi
+
+    local secret
+    secret=$(prompt_value "Секрет (32 hex, пусто — сгенерирую)" "")
+    if [[ -z "$secret" ]]; then
+        secret=$(head -c 16 /dev/urandom | xxd -ps)
+        ok_inline "Сгенерирован: ${secret}"
+    elif ! [[ "$secret" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        fail_inline "Секрет должен быть ровно 32 hex-символа"; sleep 2; return
+    fi
+
+    printf '  Создаю пользователя... '
+    local result
+    result=$(curl -s -X POST "http://127.0.0.1:${PROXY_API_PORT}/v1/users" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${name}\",\"secret\":\"${secret}\"}" 2>/dev/null || true)
+
+    if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+        ok_inline "Создан через API (без перезапуска)"
+    else
+        printf '%s\n  Fallback: правлю конфиг + перезапуск...%s ' "$C_YLW" "$C_RST"
+        if grep -q "^${name} = " "$TELEMT_CONF" 2>/dev/null; then
+            fail_inline "Пользователь уже существует в конфиге"; sleep 2; return
+        fi
+        if grep -q "^\[access\.users\]" "$TELEMT_CONF" 2>/dev/null; then
+            sed -i "/^\[access\.users\]/a ${name} = \"${secret}\"" "$TELEMT_CONF"
+        else
+            printf '\n[access.users]\n%s = "%s"\n' "$name" "$secret" >> "$TELEMT_CONF"
+        fi
+        systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 && sleep 3
+        systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1 \
+            && ok_inline "Готово (telemt перезапущен)" \
+            || fail_inline "telemt не запустился — проверь пункт 5"
+    fi
+
+    local DOMAIN="" TLS_DOMAIN=""
+    [[ -f .env ]] && source .env 2>/dev/null || true
+    local hex_mask
+    hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
+    printf '\n%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
+        "$C_GRN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret" "$hex_mask"
+    printf '%sРезервная (dd):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=dd%s\n' \
+        "$C_CYN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret"
+    pause
+}
+
+_users_edit() {
+    local api_data="$1"
+    printf '\n%s─── Изменить пользователя ───%s\n\n' "$C_BLD" "$C_RST"
+    local name
+    name=$(prompt_value "Имя пользователя" "")
+    [[ -z "$name" ]] && return
+
+    printf '\n  %s1)%s Квота трафика   %s2)%s Срок действия   %s3)%s Макс. устройств   %s4)%s Вкл/Выкл\n' \
+        "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST"
+    printf 'Что изменить? '
+    local opt; read -r opt </dev/tty || return
+
+    local payload=""
+    case "$opt" in
+        1)
+            local gb; gb=$(prompt_value "Квота ГБ (пусто — снять лимит)" "")
+            [[ -n "$gb" ]] && payload="{\"data_quota_bytes\":$(( gb * 1024 * 1024 * 1024 ))}" \
+                           || payload='{"data_quota_bytes":null}'
+            ;;
+        2)
+            local dt; dt=$(prompt_value "Дата YYYY-MM-DD (пусто — снять)" "")
+            [[ -n "$dt" ]] && payload="{\"expiration_rfc3339\":\"${dt}T23:59:59Z\"}" \
+                           || payload='{"expiration_rfc3339":null}'
+            ;;
+        3)
+            local mx; mx=$(prompt_value "Макс IP/устройств (пусто — снять)" "")
+            [[ -n "$mx" ]] && payload="{\"max_unique_ips\":${mx}}" \
+                           || payload='{"max_unique_ips":null}'
+            ;;
+        4)
+            local cur
+            cur=$(printf '%s' "$api_data" | python3 -c "
+import sys,json
+n='${name}'
+d=json.load(sys.stdin)
+u=next((x for x in d['data'] if x['username']==n),None)
+print('true' if u and u.get('enabled',True) else 'false')
+" 2>/dev/null || echo "true")
+            [[ "$cur" == "true" ]] && payload='{"enabled":false}' || payload='{"enabled":true}'
+            ;;
+        *) return ;;
+    esac
+
+    [[ -z "$payload" ]] && return
+    printf '  Применяю... '
+    local result
+    result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${name}" \
+        -H "Content-Type: application/json" -d "$payload" 2>/dev/null || true)
+    printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null \
+        && ok_inline "Применено без перезапуска" \
+        || { fail_inline "Ошибка"; printf '  %s\n' "$result"; }
+    sleep 2
+}
+
+_users_show_link() {
+    local api_data="$1"
+    printf '\n%s─── Ссылка пользователя ───%s\n\n' "$C_BLD" "$C_RST"
+    local name; name=$(prompt_value "Имя пользователя" ""); [[ -z "$name" ]] && return
+
+    local secret
+    secret=$(printf '%s' "$api_data" | python3 -c "
+import sys,json
+n='${name}'
+d=json.load(sys.stdin)
+u=next((x for x in d['data'] if x['username']==n),None)
+if not u: print(''); sys.exit()
+links=u.get('links',{}).get('tls',[])
+if not links: print(''); sys.exit()
+s=links[0].split('secret=')[-1]
+print(s[2:34] if s[:2] in ('ee','dd') else s[:32])
+" 2>/dev/null || echo "")
+
+    if [[ -z "$secret" ]]; then
+        fail_inline "Пользователь не найден или нет TLS-ссылки"; sleep 2; return
+    fi
+
+    local DOMAIN="" TLS_DOMAIN=""
+    [[ -f .env ]] && source .env 2>/dev/null || true
+    local hex_mask
+    hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
+    printf '%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
+        "$C_GRN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret" "$hex_mask"
+    printf '%sРезервная (dd):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=dd%s\n' \
+        "$C_CYN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret"
+    pause
+}
+
+_users_delete() {
+    local api_data="$1"
+    printf '\n%s─── Удалить пользователя ───%s\n\n' "$C_BLD" "$C_RST"
+    local name; name=$(prompt_value "Имя пользователя" ""); [[ -z "$name" ]] && return
+
+    if [[ "$name" == "user1" ]]; then
+        fail_inline "user1 — основной, удалить нельзя"; sleep 2; return
+    fi
+    if ! confirm "Удалить ${name}? Ссылка перестанет работать." N; then return; fi
+
+    printf '  Удаляю... '
+    local result
+    result=$(curl -s -X DELETE "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${name}" 2>/dev/null || true)
+    if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+        ok_inline "Удалён"
+    else
+        printf '%s\n  DELETE не поддерживается — выключаю пользователя...%s ' "$C_YLW" "$C_RST"
+        result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${name}" \
+            -H "Content-Type: application/json" -d '{"enabled":false}' 2>/dev/null || true)
+        printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null \
+            && ok_inline "Выключен (ссылка не работает)" || fail_inline "Ошибка API"
+    fi
+    sleep 2
+}
+
+action_manage_users() {
+    while true; do
+        print_header
+        printf '%s═══ Пользователи ═══%s\n\n' "$C_BLD" "$C_RST"
+
+        local api_data
+        api_data=$(curl -s "http://127.0.0.1:${PROXY_API_PORT}/v1/users" 2>/dev/null || true)
+        if ! printf '%s' "$api_data" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+            fail_inline "telemt API недоступен — сервис запущен?"
+            pause; return
+        fi
+
+        _users_print_table "$api_data"
+
+        printf '\n  %s1)%s Добавить   %s2)%s Изменить/квота   %s3)%s Ссылка   %s4)%s Удалить   %s0)%s Назад\n' \
+            "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '%sВыбор:%s ' "$C_BLD" "$C_RST"
+        local sub
+        read -r sub </dev/tty || break
+        case "$sub" in
+            1) _users_add ;;
+            2) _users_edit "$api_data" ;;
+            3) _users_show_link "$api_data" ;;
+            4) _users_delete "$api_data" ;;
+            0|"") break ;;
+            *) printf '%sНеверный выбор%s\n' "$C_RED" "$C_RST"; sleep 1 ;;
+        esac
+    done
+}
+
 # ============ MAIN ============
 
 main() {
@@ -1331,6 +1565,7 @@ main() {
             15) action_update_telemt ;;
             16) action_set_adtag ;;
             17) action_stats ;;
+            18) action_manage_users ;;
             0|q|Q|exit|"") clear; exit 0 ;;
             *) printf '%sНеверный выбор: %s%s\n' "$C_RED" "$choice" "$C_RST"; sleep 1 ;;
         esac
