@@ -11,5 +11,10 @@ CLAUDE.md
 # Артефакты Docker
 *.log
 
+# Python кэш
+__pycache__/
+*.pyc
+
 # Внутренняя документация (не для публичного репо)
 .stack/
+IMPROVEMENTS.md

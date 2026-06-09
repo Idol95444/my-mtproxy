@@ -537,6 +537,7 @@ User=telemt
 Group=telemt
 WorkingDirectory=/opt/telemt
 ExecStart=${TELEMT_BIN} ${TELEMT_CONF}
+Environment=RUST_LOG=error
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
