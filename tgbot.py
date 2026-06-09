@@ -6,7 +6,8 @@ MTProxy Telegram Bot с inline-кнопками.
 """
 import json, os, re, sys, time, secrets, subprocess, urllib.request, urllib.parse
 
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+ENV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+AUDIT_LOG  = "/var/log/telemt-audit.jsonl"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -140,6 +141,41 @@ def kb_confirm_del(name):
          ("↩ Отмена",        f"user_detail:{name}")],
     )
 
+# ── Накопленный трафик (с учётом рестартов telemt) ───────────────────────────
+
+def get_traffic_offsets():
+    """
+    Читает аудит-лог и возвращает накопленные байты предыдущих сессий на юзера.
+    Каждый рестарт telemt обнуляет total_octets → находим падения и суммируем пики.
+    Формула в боте: offsets[user] + current_api_octets = реальный накопленный трафик.
+    """
+    try:
+        with open(AUDIT_LOG) as f:
+            lines = f.readlines()
+    except OSError:
+        return {}
+    acc   = {}   # имя → накоплено из завершённых сессий
+    prev  = {}   # имя → значение в прошлом снапшоте
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            snap = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for u in snap.get("data", []):
+            name = u.get("username", "")
+            cur  = u.get("total_octets", 0)
+            if name not in acc:
+                acc[name] = 0
+                prev[name] = 0
+            # рестарт: счётчик упал → добавляем максимум завершённой сессии
+            if cur < prev[name]:
+                acc[name] += prev[name]
+            prev[name] = cur
+    return acc
+
 # ── telemt API ────────────────────────────────────────────────────────────────
 
 def api_get(path):
@@ -168,11 +204,12 @@ def build_stats():
     d = api_get("/v1/users")
     if not d.get("ok"):
         return "❌ telemt API недоступен — сервис запущен?", None
-    users = d["data"]
+    users   = d["data"]
+    offsets = get_traffic_offsets()
     conn = sum(u.get("current_connections", 0) for u in users)
     ips  = sum(u.get("active_unique_ips", 0)   for u in users)
     rec  = sum(u.get("recent_unique_ips", 0)   for u in users)
-    gb   = sum(u.get("total_octets", 0)        for u in users) / 1024**3
+    gb   = sum(offsets.get(u["username"], 0) + u.get("total_octets", 0) for u in users) / 1024**3
     return (
         f"📊 <b>Статистика MTProxy</b>\n\n"
         f"Соединений:       <b>{conn}</b>\n"
@@ -185,11 +222,12 @@ def build_users():
     d = api_get("/v1/users")
     if not d.get("ok"):
         return "❌ telemt API недоступен", None
-    users = d["data"]
+    users   = d["data"]
+    offsets = get_traffic_offsets()
     lines = ["👥 <b>Пользователи</b>\n"]
     for u in users:
         icon  = "✅" if u.get("enabled", True) else "🚫"
-        gb    = u.get("total_octets", 0) / 1024**3
+        gb    = (offsets.get(u["username"], 0) + u.get("total_octets", 0)) / 1024**3
         conn  = u.get("current_connections", 0)
         ips   = u.get("active_unique_ips", 0)
         quota = u.get("data_quota_bytes")
@@ -208,7 +246,8 @@ def build_user_detail(name):
     if not u:
         return f"❌ Пользователь {name} не найден", None
     enabled = u.get("enabled", True)
-    gb    = u.get("total_octets", 0) / 1024**3
+    offsets = get_traffic_offsets()
+    gb    = (offsets.get(name, 0) + u.get("total_octets", 0)) / 1024**3
     conn  = u.get("current_connections", 0)
     ips   = u.get("active_unique_ips", 0)
     quota = u.get("data_quota_bytes")
