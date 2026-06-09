@@ -25,7 +25,7 @@ whitelist = ["127.0.0.1/32"]
 [censorship]
 tls_domain = "__TLS_DOMAIN__"
 mask = true
-mask_port = 443
+mask_port = 8443
 tls_emulation = true
 unknown_sni_action = "reject_handshake"
 
