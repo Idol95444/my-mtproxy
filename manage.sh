@@ -689,8 +689,10 @@ action_security() {
         printf 'xt_recent '
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP
+        # Порядок важен: SET вставляется первым (позиция 1), потом CHECK+DROP
+        # вставляется вторым → занимает позицию 1. Итог: CHECK→DROP идёт ДО SET→ACCEPT.
         iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT
+        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP
         if command -v iptables-save >/dev/null 2>&1; then
             mkdir -p /etc/iptables
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
