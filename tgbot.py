@@ -97,7 +97,7 @@ def kb(*rows):
 def kb_main():
     return kb(
         [("📊 Статистика", "stats"),   ("👥 Пользователи", "users")],
-        [("⚙️ Управление",  "mgmt_hint")],
+        [("🖥 Мониторинг",  "monitor"), ("⚙️ Управление",   "mgmt_hint")],
     )
 
 def kb_stats():
@@ -133,6 +133,12 @@ def kb_user_detail(name, enabled):
         [("♾ Снять квоту",  f"quota:{name}:0"),
          ("🗑 Удалить",      f"user_del:{name}")],
         [("◀️ Пользователи", "users")],
+    )
+
+def kb_monitor():
+    return kb(
+        [("🔄 Обновить", "monitor")],
+        [("◀️ Главная",  "main")],
     )
 
 def kb_confirm_del(name):
@@ -290,6 +296,107 @@ def build_user_links(name):
         f"<b>dd (резерв):</b>\n<code>{dd}</code>"
     ), kb([("◀️ Назад", f"user_detail:{name}")])
 
+def build_monitor():
+    lines = ["🖥 <b>Мониторинг сервера</b>\n"]
+
+    # RAM и Swap
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mem[k.strip()] = int(v.split()[0])
+        total  = mem["MemTotal"]    // 1024
+        avail  = mem["MemAvailable"] // 1024
+        used   = total - avail
+        swap_t = mem.get("SwapTotal", 0) // 1024
+        swap_u = (mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) // 1024
+        lines.append(f"💾 RAM: {used} / {total} MB  (свободно {avail} MB)")
+        if swap_t > 0:
+            lines.append(f"   Swap: {swap_u} / {swap_t} MB")
+    except Exception:
+        lines.append("💾 RAM: недоступно")
+
+    # Диск
+    try:
+        r = subprocess.run(
+            ["df", "/", "--output=size,used,pcent"],
+            capture_output=True, text=True, timeout=3,
+        )
+        row = r.stdout.strip().splitlines()
+        if len(row) >= 2:
+            size_kb, used_kb, pct = row[1].split()
+            lines.append(
+                f"💽 Диск: {pct} ({int(used_kb)/1024**2:.1f} / {int(size_kb)/1024**2:.1f} GB)"
+            )
+    except Exception:
+        lines.append("💽 Диск: недоступно")
+
+    # CPU load average
+    try:
+        with open("/proc/loadavg") as f:
+            la = f.read().split()
+        lines.append(f"📈 CPU load: {la[0]}  {la[1]}  {la[2]}")
+    except Exception:
+        pass
+
+    # Аптайм
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+        d = int(secs // 86400)
+        h = int((secs % 86400) // 3600)
+        m = int((secs % 3600) // 60)
+        parts = []
+        if d: parts.append(f"{d}д")
+        if h: parts.append(f"{h}ч")
+        parts.append(f"{m}м")
+        lines.append(f"⏱ Аптайм: {' '.join(parts)}")
+    except Exception:
+        pass
+
+    lines.append("")
+
+    # Состояние telemt
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "telemt"],
+            capture_output=True, text=True, timeout=3,
+        )
+        st = r.stdout.strip()
+        lines.append(f"🔄 telemt: {'✅' if st == 'active' else '🔴'} {st}")
+    except Exception:
+        lines.append("🔄 telemt: ❓")
+
+    d = api_get("/v1/users")
+    if d.get("ok"):
+        users = d["data"]
+        conn  = sum(u.get("current_connections", 0) for u in users)
+        ips   = sum(u.get("active_unique_ips",   0) for u in users)
+        lines.append(f"   Соединений: {conn}  |  Уник. IP: {ips}")
+
+    lines.append("")
+
+    # fail2ban
+    try:
+        r = subprocess.run(
+            ["fail2ban-client", "status", "sshd"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.splitlines():
+            if "Currently banned" in line:
+                num = line.split(":")[-1].strip()
+                lines.append(f"🛡 fail2ban SSH: {num} IP заблокировано")
+            elif "Banned IP list" in line:
+                ips_str = line.split(":", 1)[-1].strip()
+                if ips_str:
+                    lines.append(f"   {ips_str[:80]}")
+    except Exception:
+        pass
+
+    lines.append(f"\n🕐 {time.strftime('%H:%M:%S  %d.%m.%Y')}")
+    return "\n".join(lines), kb_monitor()
+
 # ── Callback router ───────────────────────────────────────────────────────────
 
 def on_callback(cb_id, chat_id, msg_id, data):
@@ -297,6 +404,10 @@ def on_callback(cb_id, chat_id, msg_id, data):
 
     if data == "main":
         edit(chat_id, msg_id, "📖 <b>MTProxy Bot</b>\nВыбери действие:", kb_main())
+
+    elif data == "monitor":
+        text, markup = build_monitor()
+        edit(chat_id, msg_id, text, markup)
 
     elif data == "stats":
         text, markup = build_stats()
@@ -462,11 +573,16 @@ def cmd_block(chat_id, args):
     except subprocess.CalledProcessError as e:
         send(chat_id, f"❌ iptables: {e.stderr.decode().strip()}")
 
+def cmd_monitor(chat_id, _):
+    text, markup = build_monitor()
+    send(chat_id, text, markup)
+
 def cmd_help(chat_id, _):
     send(chat_id,
          "📖 <b>MTProxy Bot — команды</b>\n\n"
          "/stats — статистика прокси\n"
          "/users — список пользователей\n"
+         "/monitor — мониторинг сервера\n"
          "/adduser &lt;имя&gt; — добавить пользователя\n"
          "/link &lt;user&gt; — ссылки пользователя\n"
          "/quota &lt;user&gt; &lt;ГБ&gt; — квота (0 = снять)\n"
@@ -478,6 +594,7 @@ COMMANDS = {
     "help":    cmd_help,
     "stats":   cmd_stats,
     "users":   cmd_users,
+    "monitor": cmd_monitor,
     "adduser": cmd_adduser,
     "link":    cmd_link,
     "quota":   cmd_quota,
