@@ -48,6 +48,11 @@ def _tg_json(method, payload):
     try:
         with urllib.request.urlopen(req, timeout=35) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # 400 при editMessageText = текст не изменился, это не ошибка
+        if not (method == "editMessageText" and e.code == 400):
+            print(f"tg/{method}: {e}", file=sys.stderr)
+        return {}
     except Exception as e:
         print(f"tg/{method}: {e}", file=sys.stderr)
         return {}
