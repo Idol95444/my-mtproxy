@@ -683,16 +683,23 @@ action_security() {
     ufw --force enable >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # xt_recent: 1 SYN/сек на IP — надёжнее ufw limit против активного зондирования DPI
+    # xt_recent: burst-толерантный rate-limit (15 SYN за 5 сек на IP).
+    # ВАЖНО: жёсткий лимит 1 SYN/сек ломает Telegram — клиент открывает до 8
+    # параллельных соединений (медиа!), всё после первого дропалось → отвалы,
+    # долгое подключение, неработающее медиа. Burst 15/5с пропускает клиентов,
+    # но блокирует активное зондирование DPI (сканеры шлют десятки SYN подряд).
     printf '  Добавляю iptables rate-limit на порт 443... '
     if modprobe xt_recent 2>/dev/null; then
         printf 'xt_recent '
+        # удаляем все варианты старых правил (включая устаревший 1 SYN/сек)
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
-        # Порядок важен: SET вставляется первым (позиция 1), потом CHECK+DROP
-        # вставляется вторым → занимает позицию 1. Итог: CHECK→DROP идёт ДО SET→ACCEPT.
-        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT
-        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP
+        iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
+        # Схема как у ufw limit: SET записывает SYN (без вердикта),
+        # UPDATE+hitcount дропает при превышении 15 SYN за 5 сек
+        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP
+        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set
         if command -v iptables-save >/dev/null 2>&1; then
             mkdir -p /etc/iptables
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -1040,6 +1047,8 @@ action_uninstall() {
     printf '  Убираю iptables rate-limit... '
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     if command -v docker >/dev/null 2>&1; then
