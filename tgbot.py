@@ -443,11 +443,6 @@ def on_callback(cb_id, chat_id, msg_id, data):
         d    = api_get("/v1/users")
         u    = next((x for x in d.get("data", []) if x["username"] == name), None)
         enabled = u.get("enabled", True) if u else True
-        # user1 — основная публичная ссылка: выключение кладёт сотни клиентов
-        # в retry-шторм (SYN-флуд, отвалы у всех). Выключать только вручную в TOML.
-        if name == "user1" and enabled:
-            answer_cb(cb_id, "⛔ user1 — основная ссылка, выключать нельзя")
-            return
         api_call("PATCH", f"/v1/users/{name}", {"enabled": not enabled})
         text, markup = build_user_detail(name)
         edit(chat_id, msg_id, text, markup)
@@ -462,10 +457,6 @@ def on_callback(cb_id, chat_id, msg_id, data):
 
     elif data.startswith("user_del:"):
         name = data.split(":", 1)[1]
-        if name == "user1":
-            edit(chat_id, msg_id, "❌ user1 — основной, удалить нельзя",
-                 kb([("◀️ Назад", "users")]))
-            return
         edit(chat_id, msg_id,
              f"⚠️ Удалить <b>{name}</b>?\nЕго ссылка перестанет работать.",
              kb_confirm_del(name))
@@ -473,8 +464,14 @@ def on_callback(cb_id, chat_id, msg_id, data):
     elif data.startswith("user_del_ok:"):
         name = data.split(":", 1)[1]
         r = api_call("DELETE", f"/v1/users/{name}")
+        # НЕ откатываемся на enabled:false при ошибке — выключенный (но не удалённый)
+        # юзер кладёт клиентов в retry-шторм. telemt 3.4.15+ поддерживает DELETE.
         if not r.get("ok"):
-            api_call("PATCH", f"/v1/users/{name}", {"enabled": False})
+            edit(chat_id, msg_id,
+                 f"❌ Не удалось удалить <b>{name}</b> (API вернул ошибку).\n"
+                 f"Юзер НЕ выключен, чтобы не вызвать шторм переподключений.",
+                 kb([("◀️ Пользователи", "users")]))
+            return
         text, markup = build_users()
         edit(chat_id, msg_id, text, markup)
 

@@ -570,14 +570,12 @@ EOF
     local AD_TAG=""
     [[ -f .env ]] && { source .env 2>/dev/null || true; }
     if [[ -n "${AD_TAG:-}" ]]; then
-        printf '  Применяю AD_TAG из .env... '
-        local tag_result
-        tag_result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
-            -H "Content-Type: application/json" \
-            -d "{\"user_ad_tag\":\"${AD_TAG}\"}" 2>/dev/null || true)
-        printf '%s' "$tag_result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null \
-            && ok_inline "AD_TAG применён" \
-            || printf '%sпропущено (проверь пункт 16)%s\n' "$C_YLW" "$C_RST"
+        printf '  Применяю AD_TAG из .env (всем пользователям)... '
+        if apply_ad_tag_all "$AD_TAG"; then
+            ok_inline "AD_TAG применён"
+        else
+            printf '%sпропущено (проверь пункт 16)%s\n' "$C_YLW" "$C_RST"
+        fi
     fi
 
     local hex_mask link_ee link_dd
@@ -592,6 +590,32 @@ EOF
     [[ -z "${AD_TAG:-}" ]] && printf '%sСпонсорский канал:%s запусти пункт 16 (AD_TAG)\n' "$C_BLD" "$C_RST"
 
     pause
+}
+
+# Применяет AD_TAG (спонсорский канал) ВСЕМ пользователям telemt.
+# AD_TAG общий для прокси — раньше был захардкожен на user1, теперь не зависит
+# ни от одного конкретного юзера. Пустой аргумент = очистить тег у всех.
+# Возвращает успех, только если все PATCH прошли и хотя бы один юзер существует.
+apply_ad_tag_all() {
+    local tag="$1" payload users u ok=0 fail=0
+    if [[ -n "$tag" ]]; then
+        payload="{\"user_ad_tag\":\"${tag}\"}"
+    else
+        payload='{"user_ad_tag":null}'
+    fi
+    users=$(curl -s "http://127.0.0.1:${PROXY_API_PORT}/v1/users" 2>/dev/null \
+        | python3 -c "import sys,json; print('\n'.join(u['username'] for u in json.load(sys.stdin).get('data',[])))" 2>/dev/null || true)
+    [[ -z "$users" ]] && return 1
+    for u in $users; do
+        if curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${u}" \
+            -H "Content-Type: application/json" -d "$payload" 2>/dev/null \
+            | python3 -c "import sys,json; exit(0 if json.load(sys.stdin).get('ok') else 1)" 2>/dev/null; then
+            ok=$((ok+1))
+        else
+            fail=$((fail+1))
+        fi
+    done
+    [[ $fail -eq 0 && $ok -gt 0 ]]
 }
 
 # ============ ACTIONS: SECURITY ============
@@ -831,33 +855,51 @@ action_start() {
 
 action_show_link() {
     print_header
-    printf '%s═══ Ссылка для пользователей ═══%s\n\n' "$C_BLD" "$C_RST"
+    printf '%s═══ Ссылки пользователей ═══%s\n\n' "$C_BLD" "$C_RST"
     if [[ ! -f .env ]]; then
         fail_inline ".env не найден. Сначала установи прокси."
         pause; return
     fi
 
-    local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
+    local DOMAIN="" TLS_DOMAIN=""
     # shellcheck source=/dev/null
     source .env
+    local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
 
-    if [[ -z "$DOMAIN" || -z "$BASE_SECRET" || -z "$TLS_DOMAIN" ]]; then
-        fail_inline "В .env нет DOMAIN, BASE_SECRET или TLS_DOMAIN"
+    if [[ -z "$DOMAIN" || -z "$mask" ]]; then
+        fail_inline "В .env нет DOMAIN или TLS_DOMAIN"
         pause; return
     fi
 
-    local hex_mask link_ee link_dd
-    hex_mask=$(printf '%s' "$TLS_DOMAIN" | xxd -ps | tr -d '\n')
-    link_ee="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
-    link_dd="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=dd${BASE_SECRET}"
+    # Ссылки берём из API по каждому юзеру — больше не зависим от BASE_SECRET/user1
+    local api_data
+    api_data=$(curl -s "http://127.0.0.1:${PROXY_API_PORT}/v1/users" 2>/dev/null || true)
+    if ! printf '%s' "$api_data" | python3 -c "import sys,json; exit(0 if json.load(sys.stdin).get('ok') else 1)" 2>/dev/null; then
+        fail_inline "telemt API недоступен — сервис запущен?"
+        pause; return
+    fi
 
-    printf '%sОсновная (FakeTLS, рекомендуется):%s\n' "$C_BLD" "$C_RST"
-    printf '%s%s%s\n\n' "$C_GRN" "$link_ee" "$C_RST"
-
-    printf '%sДля пользователей с VPN (VLESS и др.):%s\n' "$C_BLD" "$C_RST"
-    printf '%s%s%s\n\n' "$C_CYN" "$link_dd" "$C_RST"
-
-    printf '%sМаска ee: %s | dd-режим работает с любым VPN-клиентом%s\n' "$C_DIM" "$TLS_DOMAIN" "$C_RST"
+    printf '%s' "$api_data" | DOMAIN="$DOMAIN" PORT="$PROXY_PORT" MASK="$mask" python3 -c '
+import sys, json, os
+domain = os.environ["DOMAIN"]; port = os.environ["PORT"]; mask = os.environ["MASK"]
+hexmask = mask.encode().hex()
+GRN="\033[32m"; CYN="\033[36m"; BLD="\033[1m"; RST="\033[0m"
+for u in json.load(sys.stdin).get("data", []):
+    tls = u.get("links", {}).get("tls", [])
+    if not tls:
+        continue
+    s = tls[0].split("secret=")[-1]
+    secret = s[2:34] if s[:2] in ("ee", "dd") else s[:32]
+    ee = f"https://t.me/proxy?server={domain}&port={port}&secret=ee{secret}{hexmask}"
+    dd = f"https://t.me/proxy?server={domain}&port={port}&secret=dd{secret}"
+    name = u["username"]
+    icon = "" if u.get("enabled", True) else " (выключен)"
+    print(f"{BLD}{name}{icon}{RST}")
+    print(f"  {GRN}FakeTLS:{RST} {ee}")
+    print(f"  {CYN}dd:     {RST} {dd}")
+    print()
+'
+    printf '%sМаска ee: %s | dd-режим работает с любым VPN-клиентом%s\n' "$C_DIM" "$mask" "$C_RST"
     pause
 }
 
@@ -991,9 +1033,7 @@ action_self_update() {
                 source .env 2>/dev/null || true
                 if [[ -n "${AD_TAG:-}" ]]; then
                     sleep 3
-                    curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"user_ad_tag\":\"${AD_TAG}\"}" >/dev/null 2>&1 || true
+                    apply_ad_tag_all "$AD_TAG" >/dev/null 2>&1 || true
                     ok_inline "AD_TAG восстановлен"
                 fi
             fi
@@ -1220,24 +1260,13 @@ action_set_adtag() {
         pause; return
     fi
 
-    printf '  Применяю через API... '
-    local payload result
-    if [[ -n "$new_tag" ]]; then
-        payload="{\"user_ad_tag\":\"${new_tag}\"}"
-    else
-        payload='{"user_ad_tag":null}'
-    fi
-    result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/user1" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>/dev/null || true)
-
-    if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+    printf '  Применяю всем пользователям через API... '
+    if apply_ad_tag_all "$new_tag"; then
         ok_inline "Применено без перезапуска"
         sed -i "s/^AD_TAG=.*/AD_TAG=${new_tag}/" .env 2>/dev/null || true
         [[ -z "$(grep '^AD_TAG=' .env 2>/dev/null)" ]] && printf '\nAD_TAG=%s\n' "$new_tag" >> .env || true
     else
-        fail_inline "API вернул ошибку"
-        printf '%s%s%s\n' "$C_DIM" "$result" "$C_RST"
+        fail_inline "API вернул ошибку (применено не всем пользователям)"
     fi
 
     pause
@@ -1628,9 +1657,6 @@ _users_delete() {
     printf '\n%s─── Удалить пользователя ───%s\n\n' "$C_BLD" "$C_RST"
     local name; name=$(prompt_value "Имя пользователя" ""); [[ -z "$name" ]] && return
 
-    if [[ "$name" == "user1" ]]; then
-        fail_inline "user1 — основной, удалить нельзя"; sleep 2; return
-    fi
     if ! confirm "Удалить ${name}? Ссылка перестанет работать." N; then return; fi
 
     printf '  Удаляю... '
