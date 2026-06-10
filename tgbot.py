@@ -443,6 +443,11 @@ def on_callback(cb_id, chat_id, msg_id, data):
         d    = api_get("/v1/users")
         u    = next((x for x in d.get("data", []) if x["username"] == name), None)
         enabled = u.get("enabled", True) if u else True
+        # user1 — основная публичная ссылка: выключение кладёт сотни клиентов
+        # в retry-шторм (SYN-флуд, отвалы у всех). Выключать только вручную в TOML.
+        if name == "user1" and enabled:
+            answer_cb(cb_id, "⛔ user1 — основная ссылка, выключать нельзя")
+            return
         api_call("PATCH", f"/v1/users/{name}", {"enabled": not enabled})
         text, markup = build_user_detail(name)
         edit(chat_id, msg_id, text, markup)
