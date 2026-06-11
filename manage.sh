@@ -1122,6 +1122,21 @@ net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 3
 # conntrack: сокращаем таймаут мёртвых established с 5 суток до 1 часа
 net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+# conntrack: дефолтный max 65536 переполнялся retry-штормом (table full =
+# ядро дропает пакеты НОВЫХ соединений → «прокси не подключается»).
+# 262144 записей ≈ 80 МБ RAM worst-case — допустимо для VPS от 2 ГБ.
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_buckets = 65536
+# conntrack: короткоживущие состояния чистим быстрее (флуд-коннекты
+# не должны висеть в таблице по 60-120 секунд)
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 30
+# listen-очередь: при всплесках SYN переполнялась (см. netstat -s overflow);
+# telemt берёт backlog = min(своего, somaxconn) при старте
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
 EOF
     sysctl --system >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
