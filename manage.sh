@@ -427,12 +427,19 @@ action_deploy() {
         "$C_BLD" "$C_RST" "$DOMAIN"
     printf '       telemt выпустит Let'\''s Encrypt cert + nginx:8443 + NAT-редирект.\n'
     printf '       %sCDN-домен%s — проще, но конфликтует с VPN-клиентами (sniff override).\n\n' "$C_BLD" "$C_RST"
-    local USE_OWN_DOMAIN=false TLS_EMAIL=""
+    local USE_OWN_DOMAIN=false TLS_EMAIL="" CERT_MODE="http01"
     if confirm "Маскировать своим доменом ${DOMAIN}?" Y; then
         USE_OWN_DOMAIN=true
         TLS_MASK_DOMAIN="$DOMAIN"
         ok_inline "Маска: ${DOMAIN} (свой домен)"
-        TLS_EMAIL=$(prompt_value "Email для Let's Encrypt (пусто — без email)" "")
+        printf '\n       %sСертификат:%s HTTP-01 — для одного сервера (порт 80).\n' "$C_BLD" "$C_RST"
+        printf '       DNS-01 (reg.ru) — если домен на нескольких VPS (round-robin, Вариант 2).\n'
+        if confirm "Домен на нескольких серверах? (DNS-01 reg.ru)" N; then
+            CERT_MODE="dns01-regru"
+            ok_inline "Сертификат: DNS-01 через reg.ru API"
+        else
+            TLS_EMAIL=$(prompt_value "Email для Let's Encrypt (пусто — без email)" "")
+        fi
     else
         printf '       Ищу доступный CDN с этого VPS...\n'
         if detect_tls_domain noisy; then
@@ -582,7 +589,7 @@ EOF
     # чтобы деплой с нуля воспроизводил рабочую конфигурацию, а не настраивать руками.
     if $USE_OWN_DOMAIN; then
         printf '\n%sНастраиваю TLS-фронтенд (свой домен):%s\n' "$C_BLD" "$C_RST"
-        if setup_tls_frontend "$DOMAIN" "$TLS_EMAIL"; then
+        if setup_tls_frontend "$DOMAIN" "$TLS_EMAIL" "$CERT_MODE"; then
             printf '  Перезапускаю telemt для захвата TLS-профиля... '
             systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 || true
             sleep 5
@@ -666,38 +673,100 @@ persist_iptables() {
     return 0
 }
 
+# Выпускает Let's Encrypt cert через DNS-01 (reg.ru API) — работает при round-robin
+# DNS (несколько A-записей, Вариант 2), без порта 80. acme.sh сам ставит cron на
+# авто-обновление с reloadcmd. Путь к серту возвращается в глобал CERT_DIR.
+# Нужен API-доступ в ЛК reg.ru: включить API и добавить IP этого сервера в allowlist.
+obtain_cert_regru_dns01() {
+    local domain="$1"
+    local acme="/root/.acme.sh/acme.sh"
+
+    if [[ ! -x "$acme" ]]; then
+        printf '  Ставлю acme.sh... '
+        if curl -fsSL https://get.acme.sh | sh -s email="acme@${domain}" >/dev/null 2>&1; then
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
+        else
+            fail_inline "не удалось установить acme.sh"; return 1
+        fi
+    fi
+    [[ -x "$acme" ]] || { fail_inline "acme.sh не найден после установки"; return 1; }
+
+    printf '\n  %sreg.ru API: в ЛК reg.ru включи API и добавь IP этого сервера в allowlist.%s\n' "$C_YLW" "$C_RST"
+    local ru_user ru_pass
+    ru_user=$(prompt_value "REG.RU API логин (логин аккаунта reg.ru)" "")
+    ru_pass=$(prompt_value "REG.RU API пароль (API-пароль из ЛК)" "")
+    if [[ -z "$ru_user" || -z "$ru_pass" ]]; then
+        fail_inline "Логин/пароль reg.ru пустые"; return 1
+    fi
+
+    printf '  Выпускаю cert через DNS-01 (reg.ru)... '
+    if REGRU_API_Username="$ru_user" REGRU_API_Password="$ru_pass" \
+        "$acme" --issue --dns dns_regru -d "$domain" --server letsencrypt >/dev/null 2>&1; then
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        fail_inline "acme.sh не выпустил cert (проверь API reg.ru и allowlist IP в ЛК)"
+        return 1
+    fi
+
+    CERT_DIR="/etc/telemt-tls/${domain}"
+    mkdir -p "$CERT_DIR"
+    printf '  Устанавливаю cert + авто-обновление... '
+    if "$acme" --install-cert -d "$domain" \
+        --key-file       "${CERT_DIR}/privkey.pem" \
+        --fullchain-file "${CERT_DIR}/fullchain.pem" \
+        --reloadcmd "systemctl reload nginx 2>/dev/null || systemctl restart nginx; systemctl restart telemt" >/dev/null 2>&1; then
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+        return 0
+    fi
+    fail_inline "acme.sh install-cert не прошёл"; return 1
+}
+
 # Поднимает TLS-фронтенд для маскировки СВОИМ доменом (VPN/VLESS-совместимость):
 # реальный Let's Encrypt cert + nginx на 8443 + NAT-редирект 443→8443 +
-# certbot deploy-hook. Идемпотентно. Закрывает H2 — раньше всё это настраивалось
-# вручную и не воспроизводилось при деплое с нуля.
+# пин self-fetch в /etc/hosts. Идемпотентно. Закрывает H2.
+# cert_mode: "http01" (один сервер, certbot standalone) | "dns01-regru" (round-robin).
 setup_tls_frontend() {
-    local domain="$1" email="${2:-}"
+    local domain="$1" email="${2:-}" cert_mode="${3:-http01}"
     local server_ip
     server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null \
               || curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
     server_ip=$(printf '%s' "$server_ip" | tr -d '[:space:]')
 
-    printf '  Ставлю nginx + certbot... '
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot >/dev/null 2>&1; then
-        fail_inline "apt не смог поставить nginx/certbot"; return 1
-    fi
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
-
-    # Сертификат (standalone, http-01 на порту 80). Если уже есть — переиспользуем.
-    if [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-        printf '  Выпускаю сертификат Let'\''s Encrypt для %s... ' "$domain"
-        systemctl stop nginx >/dev/null 2>&1 || true   # освобождаем порт 80
-        local reg=(--register-unsafely-without-email)
-        [[ -n "$email" ]] && reg=(-m "$email")
-        if certbot certonly --standalone --non-interactive --agree-tos \
-            "${reg[@]}" -d "$domain" --http-01-port 80 >/dev/null 2>&1; then
-            printf '%sok%s\n' "$C_GRN" "$C_RST"
-        else
-            fail_inline "certbot не выпустил cert (порт 80 занят/закрыт извне, DNS не на этот VPS?)"
-            return 1
+    local cert_fc cert_key
+    if [[ "$cert_mode" == "dns01-regru" ]]; then
+        printf '  Ставлю nginx... '
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nginx >/dev/null 2>&1; then
+            fail_inline "apt не смог поставить nginx"; return 1
         fi
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+        CERT_DIR=""
+        obtain_cert_regru_dns01 "$domain" || return 1
+        cert_fc="${CERT_DIR}/fullchain.pem"
+        cert_key="${CERT_DIR}/privkey.pem"
     else
-        printf '  Сертификат %s уже есть — использую\n' "$domain"
+        printf '  Ставлю nginx + certbot... '
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot >/dev/null 2>&1; then
+            fail_inline "apt не смог поставить nginx/certbot"; return 1
+        fi
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+        cert_fc="/etc/letsencrypt/live/${domain}/fullchain.pem"
+        cert_key="/etc/letsencrypt/live/${domain}/privkey.pem"
+        # Сертификат (standalone, http-01 на порту 80). Если уже есть — переиспользуем.
+        if [[ ! -f "$cert_fc" ]]; then
+            printf '  Выпускаю сертификат Let'\''s Encrypt для %s... ' "$domain"
+            systemctl stop nginx >/dev/null 2>&1 || true   # освобождаем порт 80
+            local reg=(--register-unsafely-without-email)
+            [[ -n "$email" ]] && reg=(-m "$email")
+            if certbot certonly --standalone --non-interactive --agree-tos \
+                "${reg[@]}" -d "$domain" --http-01-port 80 >/dev/null 2>&1; then
+                printf '%sok%s\n' "$C_GRN" "$C_RST"
+            else
+                fail_inline "certbot не выпустил cert (порт 80 занят/закрыт извне, DNS не на этот VPS?)"
+                return 1
+            fi
+        else
+            printf '  Сертификат %s уже есть — использую\n' "$domain"
+        fi
     fi
 
     # nginx на 8443 с реальным сертом — telemt берёт отсюда TLS-профиль через mask_port
@@ -707,8 +776,8 @@ server {
     listen 8443 ssl;
     server_name ${domain};
 
-    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_certificate     ${cert_fc};
+    ssl_certificate_key ${cert_key};
 
     access_log off;
     error_log /dev/null;
@@ -729,6 +798,18 @@ NGINX
         fail_inline "nginx -t не прошёл — проверь конфиг"; return 1
     fi
 
+    # КРИТИЧНО для round-robin: telemt резолвит tls_domain для self-fetch серта.
+    # При нескольких A-записях он может пойти за сертом на ДРУГОЙ узел (там telemt,
+    # а не nginx) → профиль не обновится. Пиним домен в /etc/hosts на СВОЙ IP →
+    # NAT-редирект ниже уводит self-fetch на локальный nginx:8443. Клиентов не
+    # касается (у них настоящий DNS).
+    if [[ -n "$server_ip" ]]; then
+        local hosts_line="${server_ip} ${domain}"
+        if ! grep -qF "$hosts_line" /etc/hosts 2>/dev/null; then
+            printf '%s  # telemt self-fetch TLS-профиля → локальный nginx\n' "$hosts_line" >> /etc/hosts
+        fi
+    fi
+
     # NAT-редирект: self-fetch telemt'ом серта по своему IP:443 уходит в петлю на
     # самого себя. Перенаправляем локально-сгенерированный трафик на nginx:8443.
     if [[ -n "$server_ip" ]]; then
@@ -738,19 +819,21 @@ NGINX
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     fi
 
-    # deploy-hook: при обновлении серта certbot'ом перезагрузить nginx и telemt,
-    # чтобы оба подхватили новый cert (telemt перечитает профиль через mask_port).
-    printf '  Ставлю certbot deploy-hook... '
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh <<'HOOK'
+    # deploy-hook нужен только для certbot (http-01). При DNS-01 reg.ru обновление и
+    # перезагрузку делает сам acme.sh (--reloadcmd при --install-cert).
+    if [[ "$cert_mode" != "dns01-regru" ]]; then
+        printf '  Ставлю certbot deploy-hook... '
+        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+        cat > /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh <<'HOOK'
 #!/bin/bash
 # Авто-перезагрузка nginx и telemt после обновления Let's Encrypt серта.
 set -eu
 systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
 systemctl restart telemt 2>/dev/null || true
 HOOK
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh
-    printf '%sok%s\n' "$C_GRN" "$C_RST"
+        chmod +x /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    fi
 
     persist_iptables   # NAT-правило тоже должно пережить перезагрузку
     return 0
