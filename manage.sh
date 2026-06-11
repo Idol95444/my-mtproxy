@@ -422,14 +422,25 @@ action_deploy() {
     fi
     printf '\n'
 
-    step "3/4" "TLS-маскировочный домен (CDN, который telemt будет имитировать)"
-    printf '       Telemt скачает реальный сертификат этого сайта.\n'
-    printf '       Ищу доступный с этого VPS...\n'
-    if detect_tls_domain noisy; then
-        ok_inline "Авто-выбран: ${TLS_MASK_DOMAIN}"
+    step "3/4" "TLS-маскировка"
+    printf '       %sСвоим доменом%s (%s) — рекомендуется: совместимо с VLESS/VPN-клиентами,\n' \
+        "$C_BLD" "$C_RST" "$DOMAIN"
+    printf '       telemt выпустит Let'\''s Encrypt cert + nginx:8443 + NAT-редирект.\n'
+    printf '       %sCDN-домен%s — проще, но конфликтует с VPN-клиентами (sniff override).\n\n' "$C_BLD" "$C_RST"
+    local USE_OWN_DOMAIN=false TLS_EMAIL=""
+    if confirm "Маскировать своим доменом ${DOMAIN}?" Y; then
+        USE_OWN_DOMAIN=true
+        TLS_MASK_DOMAIN="$DOMAIN"
+        ok_inline "Маска: ${DOMAIN} (свой домен)"
+        TLS_EMAIL=$(prompt_value "Email для Let's Encrypt (пусто — без email)" "")
     else
-        fail_inline "Ни один CDN-домен недоступен с этого VPS — нет исходящего HTTPS?"
-        pause; return
+        printf '       Ищу доступный CDN с этого VPS...\n'
+        if detect_tls_domain noisy; then
+            ok_inline "Авто-выбран: ${TLS_MASK_DOMAIN}"
+        else
+            fail_inline "Ни один CDN-домен недоступен с этого VPS — нет исходящего HTTPS?"
+            pause; return
+        fi
     fi
     printf '\n'
 
@@ -567,6 +578,22 @@ EOF
     fi
     ok_inline "telemt запущен"
 
+    # H2: TLS-фронтенд своим доменом (nginx:8443 + Let's Encrypt + NAT-редирект),
+    # чтобы деплой с нуля воспроизводил рабочую конфигурацию, а не настраивать руками.
+    if $USE_OWN_DOMAIN; then
+        printf '\n%sНастраиваю TLS-фронтенд (свой домен):%s\n' "$C_BLD" "$C_RST"
+        if setup_tls_frontend "$DOMAIN" "$TLS_EMAIL"; then
+            printf '  Перезапускаю telemt для захвата TLS-профиля... '
+            systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 || true
+            sleep 5
+            systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1 \
+                && printf '%sok%s\n' "$C_GRN" "$C_RST" \
+                || fail_inline "telemt не поднялся после фронтенда — проверь логи (пункт 5)"
+        else
+            printf '%s  TLS-фронтенд не настроен полностью — проверь домен и порт 80%s\n' "$C_YLW" "$C_RST"
+        fi
+    fi
+
     local AD_TAG=""
     [[ -f .env ]] && { source .env 2>/dev/null || true; }
     if [[ -n "${AD_TAG:-}" ]]; then
@@ -577,6 +604,11 @@ EOF
             printf '%sпропущено (проверь пункт 16)%s\n' "$C_YLW" "$C_RST"
         fi
     fi
+
+    # H2: сбор статистики/мониторинг (cron + logrotate) + постоянство iptables
+    printf '  Настраиваю аудит и мониторинг... '
+    if setup_audit_cron; then printf '%sok%s\n' "$C_GRN" "$C_RST"; else printf '%sпропущено%s\n' "$C_YLW" "$C_RST"; fi
+    persist_iptables >/dev/null 2>&1 || true
 
     local hex_mask link_ee link_dd
     hex_mask=$(printf '%s' "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
@@ -618,6 +650,211 @@ apply_ad_tag_all() {
     [[ $fail -eq 0 && $ok -gt 0 ]]
 }
 
+# Ставит iptables-persistent (если нет) и сохраняет ВСЕ текущие правила в
+# /etc/iptables/rules.v4 — иначе rate-limit и NAT-редирект НЕ переживут
+# перезагрузку (H1). netfilter-persistent.service восстанавливает их при boot.
+persist_iptables() {
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+        echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections 2>/dev/null || true
+        echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || return 1
+    fi
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    mkdir -p /etc/iptables
+    iptables-save  > /etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    return 0
+}
+
+# Поднимает TLS-фронтенд для маскировки СВОИМ доменом (VPN/VLESS-совместимость):
+# реальный Let's Encrypt cert + nginx на 8443 + NAT-редирект 443→8443 +
+# certbot deploy-hook. Идемпотентно. Закрывает H2 — раньше всё это настраивалось
+# вручную и не воспроизводилось при деплое с нуля.
+setup_tls_frontend() {
+    local domain="$1" email="${2:-}"
+    local server_ip
+    server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null \
+              || curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
+    server_ip=$(printf '%s' "$server_ip" | tr -d '[:space:]')
+
+    printf '  Ставлю nginx + certbot... '
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot >/dev/null 2>&1; then
+        fail_inline "apt не смог поставить nginx/certbot"; return 1
+    fi
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # Сертификат (standalone, http-01 на порту 80). Если уже есть — переиспользуем.
+    if [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+        printf '  Выпускаю сертификат Let'\''s Encrypt для %s... ' "$domain"
+        systemctl stop nginx >/dev/null 2>&1 || true   # освобождаем порт 80
+        local reg=(--register-unsafely-without-email)
+        [[ -n "$email" ]] && reg=(-m "$email")
+        if certbot certonly --standalone --non-interactive --agree-tos \
+            "${reg[@]}" -d "$domain" --http-01-port 80 >/dev/null 2>&1; then
+            printf '%sok%s\n' "$C_GRN" "$C_RST"
+        else
+            fail_inline "certbot не выпустил cert (порт 80 занят/закрыт извне, DNS не на этот VPS?)"
+            return 1
+        fi
+    else
+        printf '  Сертификат %s уже есть — использую\n' "$domain"
+    fi
+
+    # nginx на 8443 с реальным сертом — telemt берёт отсюда TLS-профиль через mask_port
+    printf '  Настраиваю nginx:8443... '
+    cat > /etc/nginx/sites-available/tg-cert <<NGINX
+server {
+    listen 8443 ssl;
+    server_name ${domain};
+
+    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+    access_log off;
+    error_log /dev/null;
+
+    location / {
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+}
+NGINX
+    ln -sf /etc/nginx/sites-available/tg-cert /etc/nginx/sites-enabled/tg-cert
+    rm -f /etc/nginx/sites-enabled/default   # убираем дефолт с порта 80
+    if nginx -t >/dev/null 2>&1; then
+        systemctl enable nginx >/dev/null 2>&1 || true
+        systemctl restart nginx >/dev/null 2>&1 || true
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        fail_inline "nginx -t не прошёл — проверь конфиг"; return 1
+    fi
+
+    # NAT-редирект: self-fetch telemt'ом серта по своему IP:443 уходит в петлю на
+    # самого себя. Перенаправляем локально-сгенерированный трафик на nginx:8443.
+    if [[ -n "$server_ip" ]]; then
+        printf '  NAT-редирект %s:443 → 8443... ' "$server_ip"
+        iptables -t nat -D OUTPUT -p tcp -d "$server_ip" --dport 443 -j REDIRECT --to-ports 8443 2>/dev/null || true
+        iptables -t nat -I OUTPUT -p tcp -d "$server_ip" --dport 443 -j REDIRECT --to-ports 8443
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    fi
+
+    # deploy-hook: при обновлении серта certbot'ом перезагрузить nginx и telemt,
+    # чтобы оба подхватили новый cert (telemt перечитает профиль через mask_port).
+    printf '  Ставлю certbot deploy-hook... '
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh <<'HOOK'
+#!/bin/bash
+# Авто-перезагрузка nginx и telemt после обновления Let's Encrypt серта.
+set -eu
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+systemctl restart telemt 2>/dev/null || true
+HOOK
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/telemt-tls-reload.sh
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    persist_iptables   # NAT-правило тоже должно пережить перезагрузку
+    return 0
+}
+
+# Ставит сбор статистики (audit.jsonl каждые 5 мин) + монитор RAM/диск/сервис
+# с алертом в Telegram + ротацию лога. Раньше настраивалось вручную (H2).
+setup_audit_cron() {
+    cat > /usr/local/bin/telemt-audit.sh <<AUDIT
+#!/bin/bash
+curl -s http://127.0.0.1:${PROXY_API_PORT}/v1/users | python3 -c "
+import sys, json, datetime
+d = json.load(sys.stdin)
+if not d.get('ok'):
+    sys.exit(1)
+d['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+print(json.dumps(d, ensure_ascii=False))
+" >> ${AUDIT_LOG}
+AUDIT
+    chmod +x /usr/local/bin/telemt-audit.sh
+
+    {
+        printf '#!/bin/bash\n'
+        printf '# Монитор RAM/диск/telemt с алертом в Telegram (антидребезг 1 час).\n'
+        printf 'ENV_FILE="%s/.env"\n' "$SCRIPT_DIR"
+        cat <<'MON'
+FLAG_FILE="/tmp/telemt-monitor-alerted"
+ALERT_COOLDOWN=3600
+
+BOT_TOKEN=""
+BOT_CHAT_ID=""
+if [[ -f "$ENV_FILE" ]]; then
+    BOT_TOKEN=$(grep -m1 '^BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
+    BOT_CHAT_ID=$(grep -m1 '^BOT_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
+fi
+[[ -z "$BOT_TOKEN" || -z "$BOT_CHAT_ID" ]] && exit 0
+
+tg_send() {
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\":\"${BOT_CHAT_ID}\",\"text\":\"$1\",\"parse_mode\":\"HTML\"}" \
+        > /dev/null
+}
+
+ALERT=""
+RAM_AVAIL=$(free -m | awk '/^Mem:/ {print $7}')
+SWAP_TOTAL=$(free -m | awk '/^Swap:/ {print $2}')
+SWAP_USED=$(free -m  | awk '/^Swap:/ {print $3}')
+
+if [[ "$RAM_AVAIL" -lt 200 ]]; then
+    ALERT="${ALERT}⚠️ RAM: доступно ${RAM_AVAIL} MB (критично &lt; 200 MB)\n"
+fi
+if [[ "$SWAP_TOTAL" -gt 0 ]]; then
+    SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
+    if [[ "$SWAP_PCT" -gt 80 ]]; then
+        ALERT="${ALERT}⚠️ Swap: ${SWAP_PCT}% заполнен (${SWAP_USED}/${SWAP_TOTAL} MB)\n"
+    fi
+fi
+if ! systemctl is-active --quiet telemt; then
+    ALERT="${ALERT}🔴 telemt: сервис не запущен!\n"
+fi
+DISK_PCT=$(df / --output=pcent | tail -1 | tr -d ' %')
+if [[ "$DISK_PCT" -gt 85 ]]; then
+    ALERT="${ALERT}💾 Диск: ${DISK_PCT}% заполнен\n"
+fi
+
+if [[ -z "$ALERT" ]]; then
+    rm -f "$FLAG_FILE"
+    exit 0
+fi
+if [[ -f "$FLAG_FILE" ]]; then
+    LAST=$(cat "$FLAG_FILE")
+    NOW=$(date +%s)
+    if (( NOW - LAST < ALERT_COOLDOWN )); then
+        exit 0
+    fi
+fi
+date +%s > "$FLAG_FILE"
+tg_send "🚨 <b>MTProxy Monitor</b>\n\n${ALERT}"
+MON
+    } > /usr/local/bin/telemt-monitor.sh
+    chmod +x /usr/local/bin/telemt-monitor.sh
+
+    cat > /etc/cron.d/telemt-audit <<CRON
+# Снапшот статистики пользователей каждые 5 минут
+*/5 * * * * root /usr/local/bin/telemt-audit.sh
+# Мониторинг памяти и состояния сервиса каждые 5 минут
+*/5 * * * * root /usr/local/bin/telemt-monitor.sh
+CRON
+
+    cat > /etc/logrotate.d/telemt-audit <<'ROT'
+/var/log/telemt-audit.jsonl {
+    rotate 30
+    daily
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+ROT
+}
+
 # ============ ACTIONS: SECURITY ============
 
 action_security() {
@@ -630,7 +867,8 @@ action_security() {
     printf 'Будет:\n'
     printf '  • просканированы открытые порты\n'
     printf '  • настроен файрвол ufw\n'
-    printf '  • на порт 443 добавлен iptables rate-limit (1 SYN/сек/IP)\n'
+    printf '  • на порт 443 добавлен iptables rate-limit (burst 15 SYN/5с на IP)\n'
+    printf '  • правила iptables сохранены и переживут перезагрузку\n'
     printf '  • установлен fail2ban\n'
     printf '  • включены автообновления безопасности\n'
     printf '  • применены sysctl-настройки (TCP keepalive — фикс залипания iOS)\n\n'
@@ -695,6 +933,8 @@ action_security() {
     printf '  Открываю порты: '
     ufw allow "${SSH_PORT}/tcp" comment "SSH" >/dev/null 2>&1 || true
     ufw allow 443/tcp comment "MTProto telemt" >/dev/null 2>&1 || true
+    # порт 80 нужен certbot для обновления Let's Encrypt серта (standalone http-01)
+    ufw allow 80/tcp comment "ACME http-01 renew" >/dev/null 2>&1 || true
     for port in "${extra_open[@]:-}"; do
         [[ -z "$port" ]] && continue
         ufw allow "${port}/tcp" comment "user-allowed" >/dev/null 2>&1 || true
@@ -724,13 +964,18 @@ action_security() {
         # UPDATE+hitcount дропает при превышении 15 SYN за 5 сек
         iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP
         iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set
-        if command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
         printf '%sxt_recent недоступен — пропущено%s\n' "$C_YLW" "$C_RST"
+    fi
+
+    # H1: ставим iptables-persistent и сохраняем правила (rate-limit + NAT-редирект),
+    # иначе после reboot они теряются.
+    printf '  Делаю правила iptables постоянными... '
+    if persist_iptables; then
+        printf '%sok%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sне удалось (поставь iptables-persistent вручную)%s\n' "$C_YLW" "$C_RST"
     fi
 
     printf '  Устанавливаю fail2ban... '
@@ -1530,14 +1775,24 @@ _users_add() {
         fail_inline "Секрет должен быть ровно 32 hex-символа"; sleep 2; return
     fi
 
+    # M2: AD_TAG (спонсорский канал) общий для прокси — проставляем сразу при
+    # создании, как это делает бот. Иначе новый юзер из CLI был бы без канала.
+    local ad_tag=""
+    ad_tag=$(grep -m1 '^AD_TAG=' .env 2>/dev/null | cut -d= -f2- || true)
+
     printf '  Создаю пользователя... '
-    local result
+    local result payload
+    if [[ -n "$ad_tag" ]]; then
+        payload="{\"username\":\"${name}\",\"secret\":\"${secret}\",\"user_ad_tag\":\"${ad_tag}\"}"
+    else
+        payload="{\"username\":\"${name}\",\"secret\":\"${secret}\"}"
+    fi
     result=$(curl -s -X POST "http://127.0.0.1:${PROXY_API_PORT}/v1/users" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${name}\",\"secret\":\"${secret}\"}" 2>/dev/null || true)
+        -H "Content-Type: application/json" -d "$payload" 2>/dev/null || true)
 
     if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
         ok_inline "Создан через API (без перезапуска)"
+        [[ -n "$ad_tag" ]] && printf '  %sAD_TAG применён%s\n' "$C_DIM" "$C_RST"
     else
         printf '%s\n  Fallback: правлю конфиг + перезапуск...%s ' "$C_YLW" "$C_RST"
         if grep -q "^${name} = " "$TELEMT_CONF" 2>/dev/null; then
@@ -1547,6 +1802,13 @@ _users_add() {
             sed -i "/^\[access\.users\]/a ${name} = \"${secret}\"" "$TELEMT_CONF"
         else
             printf '\n[access.users]\n%s = "%s"\n' "$name" "$secret" >> "$TELEMT_CONF"
+        fi
+        if [[ -n "$ad_tag" ]]; then
+            if grep -q "^\[access\.user_ad_tags\]" "$TELEMT_CONF" 2>/dev/null; then
+                sed -i "/^\[access\.user_ad_tags\]/a ${name} = \"${ad_tag}\"" "$TELEMT_CONF"
+            else
+                printf '\n[access.user_ad_tags]\n%s = "%s"\n' "$name" "$ad_tag" >> "$TELEMT_CONF"
+            fi
         fi
         systemctl restart "$TELEMT_SVC" >/dev/null 2>&1 && sleep 3
         systemctl is-active "$TELEMT_SVC" >/dev/null 2>&1 \
@@ -1595,15 +1857,27 @@ _users_edit() {
                            || payload='{"max_unique_ips":null}'
             ;;
         4)
-            local cur
-            cur=$(printf '%s' "$api_data" | python3 -c "
+            local cur conns
+            read -r cur conns < <(printf '%s' "$api_data" | python3 -c "
 import sys,json
 n='${name}'
 d=json.load(sys.stdin)
 u=next((x for x in d['data'] if x['username']==n),None)
-print('true' if u and u.get('enabled',True) else 'false')
-" 2>/dev/null || echo "true")
-            [[ "$cur" == "true" ]] && payload='{"enabled":false}' || payload='{"enabled":true}'
+print(('true' if u and u.get('enabled',True) else 'false'), (u.get('current_connections',0) if u else 0))
+" 2>/dev/null || echo "true 0")
+            if [[ "$cur" == "true" ]]; then
+                # M3: выключение активного юзера = retry-шторм (клиенты проходят
+                # handshake, ловят отказ и бесконечно ретраят). Предупреждаем.
+                if [[ "${conns:-0}" -gt 0 ]]; then
+                    printf '\n  %s⚠ У %s сейчас %s активных соединений.%s\n' "$C_YLW" "$name" "$conns" "$C_RST"
+                    printf '  %sВыключение (enabled=false) НЕ рвёт клиентов чисто — они уйдут в\n' "$C_DIM"
+                    printf '  бесконечные переподключения (шторм). Если юзер не нужен — лучше УДАЛИТЬ.%s\n' "$C_RST"
+                    confirm "Всё равно выключить ${name}?" N || { sleep 1; return; }
+                fi
+                payload='{"enabled":false}'
+            else
+                payload='{"enabled":true}'
+            fi
             ;;
         *) return ;;
     esac
@@ -1665,11 +1939,12 @@ _users_delete() {
     if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
         ok_inline "Удалён"
     else
-        printf '%s\n  DELETE не поддерживается — выключаю пользователя...%s ' "$C_YLW" "$C_RST"
-        result=$(curl -s -X PATCH "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${name}" \
-            -H "Content-Type: application/json" -d '{"enabled":false}' 2>/dev/null || true)
-        printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null \
-            && ok_inline "Выключен (ссылка не работает)" || fail_inline "Ошибка API"
+        # M1: НЕ откатываемся на enabled:false — выключенный (но не удалённый) юзер
+        # кладёт клиентов в retry-шторм (см. .stack). telemt 3.4.15+ поддерживает DELETE.
+        fail_inline "API вернул ошибку — юзер НЕ удалён"
+        printf '  %sЮзер НЕ выключен специально: выключение активного юзера вызывает%s\n' "$C_YLW" "$C_RST"
+        printf '  %sшторм переподключений. Проверь логи telemt (пункт 5).%s\n' "$C_YLW" "$C_RST"
+        printf '  %sОтвет API: %s%s\n' "$C_DIM" "$result" "$C_RST"
     fi
     sleep 2
 }

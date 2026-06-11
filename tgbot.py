@@ -443,7 +443,26 @@ def on_callback(cb_id, chat_id, msg_id, data):
         d    = api_get("/v1/users")
         u    = next((x for x in d.get("data", []) if x["username"] == name), None)
         enabled = u.get("enabled", True) if u else True
+        conns   = u.get("current_connections", 0) if u else 0
+        # M3: выключение активного юзера кладёт клиентов в retry-шторм. Если есть
+        # живые соединения — требуем подтверждение и советуем удаление вместо выключения.
+        if enabled and conns > 0:
+            edit(chat_id, msg_id,
+                 f"⚠️ У <b>{name}</b> сейчас <b>{conns}</b> активных соединений.\n\n"
+                 f"Выключение (не удаление) НЕ рвёт клиентов чисто — они уйдут в "
+                 f"бесконечные переподключения, это нагружает сервер.\n"
+                 f"Если юзер больше не нужен — лучше <b>удалить</b>.",
+                 kb([("🚫 Всё равно выключить", f"user_disable_ok:{name}"),
+                     ("🗑 Удалить",             f"user_del:{name}")],
+                    [("↩ Отмена",               f"user_detail:{name}")]))
+            return
         api_call("PATCH", f"/v1/users/{name}", {"enabled": not enabled})
+        text, markup = build_user_detail(name)
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("user_disable_ok:"):
+        name = data.split(":", 1)[1]
+        api_call("PATCH", f"/v1/users/{name}", {"enabled": False})
         text, markup = build_user_detail(name)
         edit(chat_id, msg_id, text, markup)
 
