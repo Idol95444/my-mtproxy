@@ -950,7 +950,7 @@ action_security() {
     printf 'Будет:\n'
     printf '  • просканированы открытые порты\n'
     printf '  • настроен файрвол ufw\n'
-    printf '  • на порт 443 добавлен iptables rate-limit (burst 15 SYN/5с на IP)\n'
+    printf '  • на порт 443 добавлен iptables rate-limit (20 SYN/сек, всплеск до 60 на IP)\n'
     printf '  • правила iptables сохранены и переживут перезагрузку\n'
     printf '  • установлен fail2ban\n'
     printf '  • включены автообновления безопасности\n'
@@ -1030,26 +1030,30 @@ action_security() {
     ufw --force enable >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # xt_recent: burst-толерантный rate-limit (15 SYN за 5 сек на IP).
-    # ВАЖНО: жёсткий лимит 1 SYN/сек ломает Telegram — клиент открывает до 8
-    # параллельных соединений (медиа!), всё после первого дропалось → отвалы,
-    # долгое подключение, неработающее медиа. Burst 15/5с пропускает клиентов,
-    # но блокирует активное зондирование DPI (сканеры шлют десятки SYN подряд).
+    # hashlimit: burst-толерантный rate-limit (устойчиво 20 SYN/сек, всплеск до 60 на IP).
+    # ВАЖНО: Telegram-клиент при загрузке медиа открывает до 8 параллельных
+    # соединений на КАЖДЫЙ DC, а за VPN/VLESS-выходом сидят десятки юзеров
+    # с ОДНОГО IP. Старая схема xt_recent (15 SYN/5с; потолок модуля — 20)
+    # резала такие всплески → тормоза медиа и отвалы через VPN.
+    # hashlimit пропускает всплеск до 60 SYN и 20/сек устойчиво,
+    # но режет реальный SYN-флуд (сотни-тысячи в секунду).
     printf '  Добавляю iptables rate-limit на порт 443... '
-    if modprobe xt_recent 2>/dev/null; then
-        printf 'xt_recent '
-        # удаляем все варианты старых правил (включая устаревший 1 SYN/сек)
+    if modprobe xt_hashlimit 2>/dev/null; then
+        printf 'hashlimit '
+        # удаляем старые правила xt_recent (устаревшие схемы) и прошлые hashlimit
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
-        # Схема как у ufw limit: SET записывает SYN (без вердикта),
-        # UPDATE+hitcount дропает при превышении 15 SYN за 5 сек
-        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP
-        iptables -I INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set
+        iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 443 --syn -j DROP 2>/dev/null || true
+        # Сначала ACCEPT в пределах лимита (позиция 1), затем DROP сразу под ним
+        # (позиция 2) — нет «окна», когда дропается весь новый SYN
+        iptables -I INPUT 1 -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT
+        iptables -I INPUT 2 -p tcp --dport 443 --syn -j DROP
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
-        printf '%sxt_recent недоступен — пропущено%s\n' "$C_YLW" "$C_RST"
+        printf '%sxt_hashlimit недоступен — пропущено%s\n' "$C_YLW" "$C_RST"
     fi
 
     # H1: ставим iptables-persistent и сохраняем правила (rate-limit + NAT-редирект),
@@ -1417,6 +1421,8 @@ action_uninstall() {
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -j DROP 2>/dev/null || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     if command -v docker >/dev/null 2>&1; then
@@ -1795,7 +1801,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/python3 ${BOT_SCRIPT}
 WorkingDirectory=${SCRIPT_DIR}
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
