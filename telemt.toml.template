@@ -24,10 +24,10 @@ whitelist = ["127.0.0.1/32"]
 
 [censorship]
 tls_domain = "__TLS_DOMAIN__"
-mask = true
+mask = false
 mask_port = 8443
 tls_emulation = true
-unknown_sni_action = "reject_handshake"
+unknown_sni_action = "drop"
 
 [access]
 replay_check_len = 65536
