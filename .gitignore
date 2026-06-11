@@ -2,6 +2,10 @@
 config.py
 .env
 
+# Экспорт юзеров (содержит секреты!) — переносится по scp, не через git
+users-export.json
+users*.json
+
 # Исходники alexbers (клонируются при деплое)
 src/
 
@@ -18,3 +22,4 @@ __pycache__/
 # Внутренняя документация (не для публичного репо)
 .stack/
 IMPROVEMENTS.md
+AUDIT.md

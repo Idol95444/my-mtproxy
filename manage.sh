@@ -1949,6 +1949,115 @@ _users_delete() {
     sleep 2
 }
 
+# Экспорт всех юзеров (username + secret + квота/срок/лимиты/ad_tag) в JSON-файл.
+# Файл секретный (chmod 600) — переносится на второй VPS по scp, НЕ через git.
+# Ядро мультисервера (Вариант 2): одинаковый набор юзеров на обоих узлах.
+_users_export() {
+    local api_data="$1"
+    printf '\n%s─── Экспорт пользователей ───%s\n\n' "$C_BLD" "$C_RST"
+    local out
+    out=$(prompt_value "Файл для экспорта" "/root/users-export.json")
+    [[ -z "$out" ]] && return
+
+    local count
+    count=$(printf '%s' "$api_data" | OUT="$out" python3 -c '
+import sys, json, os
+data = json.load(sys.stdin).get("data", [])
+users = []
+for u in data:
+    tls = u.get("links", {}).get("tls", [])
+    if not tls:
+        continue
+    s = tls[0].split("secret=")[-1]
+    secret = s[2:34] if s[:2] in ("ee", "dd") else s[:32]
+    users.append({
+        "username":           u["username"],
+        "secret":             secret,
+        "user_ad_tag":        u.get("user_ad_tag"),
+        "data_quota_bytes":   u.get("data_quota_bytes"),
+        "expiration_rfc3339": u.get("expiration_rfc3339"),
+        "max_unique_ips":     u.get("max_unique_ips"),
+        "max_tcp_conns":      u.get("max_tcp_conns"),
+        "enabled":            u.get("enabled", True),
+    })
+with open(os.environ["OUT"], "w") as f:
+    json.dump(users, f, ensure_ascii=False, indent=2)
+print(len(users))
+' 2>/dev/null || true)
+
+    if [[ -n "$count" && "$count" =~ ^[0-9]+$ ]]; then
+        chmod 600 "$out" 2>/dev/null || true
+        ok_inline "Экспортировано юзеров: ${count} → ${out}"
+        printf '  %sСекретный файл (chmod 600). Перенеси на второй VPS:%s\n' "$C_DIM" "$C_RST"
+        printf '    %sscp %s root@IP2:%s%s\n' "$C_CYN" "$out" "$out" "$C_RST"
+        printf '  %sзатем там: sudo proxy → 18 → 6 (Импорт). В git НЕ коммитить.%s\n' "$C_DIM" "$C_RST"
+    else
+        fail_inline "Не удалось записать экспорт (API недоступен?)"
+    fi
+    pause
+}
+
+# Импорт юзеров из JSON-файла (созданного экспортом) в локальный telemt через API.
+# Создаёт недостающих юзеров с теми же секретами; существующих пропускает.
+_users_import() {
+    printf '\n%s─── Импорт пользователей ───%s\n\n' "$C_BLD" "$C_RST"
+    local in
+    in=$(prompt_value "Файл импорта" "/root/users-export.json")
+    [[ -z "$in" ]] && return
+    if [[ ! -f "$in" ]]; then
+        fail_inline "Файл не найден: $in"; pause; return
+    fi
+    if ! python3 -c "import json; json.load(open('$in'))" 2>/dev/null; then
+        fail_inline "Файл не является корректным JSON"; pause; return
+    fi
+
+    local total
+    total=$(python3 -c "import json; print(len(json.load(open('$in'))))" 2>/dev/null || echo 0)
+    printf 'В файле юзеров: %s%s%s\n' "$C_BLD" "$total" "$C_RST"
+    printf '%sСоздаст недостающих через API; существующих пропустит (рестарт не нужен).%s\n\n' "$C_DIM" "$C_RST"
+    if ! confirm "Импортировать в этот telemt?" Y; then return; fi
+    printf '\n'
+
+    IN_FILE="$in" API="http://127.0.0.1:${PROXY_API_PORT}" python3 - <<'PYEOF' || true
+import json, os, urllib.request
+
+users = json.load(open(os.environ["IN_FILE"]))
+api   = os.environ["API"]
+
+def call(method, path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(api + path, data=data,
+                                 headers={"Content-Type": "application/json"}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+created = skipped = failed = 0
+for u in users:
+    name, secret = u.get("username"), u.get("secret")
+    if not name or not secret:
+        failed += 1; print(f"  ✗ {name or '?'}: нет username/secret"); continue
+    payload = {"username": name, "secret": secret}
+    if u.get("user_ad_tag"):
+        payload["user_ad_tag"] = u["user_ad_tag"]
+    if not call("POST", "/v1/users", payload).get("ok"):
+        skipped += 1; print(f"  • {name}: пропущен (уже есть или ошибка)"); continue
+    patch = {k: u[k] for k in
+             ("data_quota_bytes", "expiration_rfc3339", "max_unique_ips", "max_tcp_conns")
+             if u.get(k) is not None}
+    if u.get("enabled") is False:
+        patch["enabled"] = False
+    if patch:
+        call("PATCH", f"/v1/users/{name}", patch)
+    created += 1; print(f"  ✓ {name}: создан")
+
+print(f"\nСоздано: {created} | пропущено: {skipped} | ошибок: {failed}")
+PYEOF
+    pause
+}
+
 action_manage_users() {
     while true; do
         print_header
@@ -1963,8 +2072,10 @@ action_manage_users() {
 
         _users_print_table "$api_data"
 
-        printf '\n  %s1)%s Добавить   %s2)%s Изменить/квота   %s3)%s Ссылка   %s4)%s Удалить   %s0)%s Назад\n' \
-            "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '\n  %s1)%s Добавить   %s2)%s Изменить/квота   %s3)%s Ссылка   %s4)%s Удалить\n' \
+            "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_CYN" "$C_RST"
+        printf '  %s5)%s Экспорт юзеров   %s6)%s Импорт юзеров   %s(для второго VPS)%s   %s0)%s Назад\n' \
+            "$C_CYN" "$C_RST" "$C_CYN" "$C_RST" "$C_DIM" "$C_RST" "$C_DIM" "$C_RST"
         printf '%sВыбор:%s ' "$C_BLD" "$C_RST"
         local sub
         read -r sub </dev/tty || break
@@ -1973,6 +2084,8 @@ action_manage_users() {
             2) _users_edit "$api_data" ;;
             3) _users_show_link "$api_data" ;;
             4) _users_delete "$api_data" ;;
+            5) _users_export "$api_data" ;;
+            6) _users_import ;;
             0|"") break ;;
             *) printf '%sНеверный выбор%s\n' "$C_RED" "$C_RST"; sleep 1 ;;
         esac
