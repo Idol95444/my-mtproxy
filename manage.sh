@@ -569,6 +569,15 @@ EOF
     systemctl daemon-reload >/dev/null 2>&1
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
+    # Часы должны быть верны ДО старта telemt: при скью >30с middle-серверы отвергают
+    # ME-хендшейк → direct-fallback → AD_TAG не доставляется (нет спонсорского канала).
+    printf '  Синхронизирую часы (NTP)... '
+    if setup_ntp; then
+        printf '%ssynchronized%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sконфиг применён, синхронизации пока нет (проверь UDP/123)%s\n' "$C_YLW" "$C_RST"
+    fi
+
     printf '  Запускаю telemt... '
     systemctl enable "$TELEMT_SVC" >/dev/null 2>&1
     systemctl restart "$TELEMT_SVC" >/dev/null 2>&1
@@ -719,6 +728,36 @@ obtain_cert_regru_dns01() {
         return 0
     fi
     fail_inline "acme.sh install-cert не прошёл"; return 1
+}
+
+# Настраивает синхронизацию часов через ДОСТУПНЫЙ NTP. Критично: при скью >30с
+# middle-серверы Telegram отвергают ME-хендшейк telemt → direct-fallback → AD_TAG
+# не доставляется (пропадает спонсорский канал). Многие провайдеры режут UDP/123 к
+# дефолтным ntp.ubuntu.com/pool.ntp.org (timesyncd висит с Packet count: 0, часы
+# дрейфуют). Cloudflare NTP (162.159.200.x) обычно проходит — ставим его основным.
+# Идемпотентно.
+setup_ntp() {
+    mkdir -p /etc/systemd/timesyncd.conf.d
+    cat > /etc/systemd/timesyncd.conf.d/10-reachable-ntp.conf <<'EOF'
+# Провайдер часто режет UDP/123 к ntp.ubuntu.com/pool.ntp.org (timesyncd не
+# синхронит → часы убегают → ломается ME-хендшейк telemt → пропадает канал спонсора).
+# Cloudflare NTP доступен по UDP/123 — основной; google/pool как fallback.
+[Time]
+NTP=time.cloudflare.com 162.159.200.1 162.159.200.123
+FallbackNTP=time.google.com pool.ntp.org
+EOF
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+    systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
+    # ждём первую успешную синхронизацию (до ~12с)
+    local i
+    for i in $(seq 1 12); do
+        [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] && return 0
+        sleep 1
+    done
+    # не синхронизировался за окно — вернём «частичный успех»: конфиг применён,
+    # синхронизация может подтянуться позже (или UDP/123 режется и к Cloudflare)
+    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]
 }
 
 # Поднимает TLS-фронтенд для маскировки СВОИМ доменом (VPN/VLESS-совместимость):
@@ -900,6 +939,24 @@ if [[ "$DISK_PCT" -gt 85 ]]; then
     ALERT="${ALERT}💾 Диск: ${DISK_PCT}% заполнен\n"
 fi
 
+# Часы: рассинхрон NTP уводит скью >30с → middle-серверы отвергают ME-хендшейк
+# → telemt уходит в direct-fallback → AD_TAG не доставляется (пропадает спонсорский канал).
+# Ранний индикатор — ловит ДО поломки канала.
+if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+    ALERT="${ALERT}🕐 Часы: NTP не синхронизирован — скью ломает ME-хендшейк, под угрозой канал спонсора\n"
+fi
+
+# ME-пул: при живом telemt мало ESTAB к middle :8888 = direct-fallback (AD_TAG не идёт).
+# Подтверждающий симптом. Гард по аптайму >120с, чтобы не алертить на свежем старте (пул растёт ~20с).
+if systemctl is-active --quiet telemt; then
+    ME_PID=$(systemctl show -p MainPID --value telemt 2>/dev/null)
+    ME_UP=$(ps -o etimes= -p "$ME_PID" 2>/dev/null | tr -d ' ')
+    ME_CONNS=$(ss -tn state established 2>/dev/null | grep -c ':8888')
+    if [[ -n "$ME_UP" && "$ME_UP" -gt 120 && "$ME_CONNS" -lt 5 ]]; then
+        ALERT="${ALERT}📡 ME-пул: соединений к middle :8888 = ${ME_CONNS} (норма ~30-40) — спонсорский канал не доставляется (проверь часы: timedatectl)\n"
+    fi
+fi
+
 if [[ -z "$ALERT" ]]; then
     rm -f "$FLAG_FILE"
     exit 0
@@ -954,7 +1011,8 @@ action_security() {
     printf '  • правила iptables сохранены и переживут перезагрузку\n'
     printf '  • установлен fail2ban\n'
     printf '  • включены автообновления безопасности\n'
-    printf '  • применены sysctl-настройки (TCP keepalive — фикс залипания iOS)\n\n'
+    printf '  • применены sysctl-настройки (TCP keepalive — фикс залипания iOS)\n'
+    printf '  • настроена синхронизация часов (NTP на Cloudflare — без неё пропадает канал спонсора)\n\n'
 
     if ! confirm "Запустить?" Y; then
         return
@@ -1140,6 +1198,14 @@ net.ipv4.tcp_max_syn_backlog = 4096
 EOF
     sysctl --system >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # Синхронизация часов: скью >30с ломает ME-хендшейк → пропадает спонсорский канал.
+    printf '  Настраиваю синхронизацию часов (NTP)... '
+    if setup_ntp; then
+        printf '%ssynchronized%s\n' "$C_GRN" "$C_RST"
+    else
+        printf '%sконфиг применён, но синхронизации пока нет (проверь UDP/123)%s\n' "$C_YLW" "$C_RST"
+    fi
 
     printf '\n%s═══ Готово ═══%s\n' "$C_GRN$C_BLD" "$C_RST"
     pause
