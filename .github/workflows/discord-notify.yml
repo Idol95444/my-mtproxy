@@ -1,0 +1,35 @@
+name: Discord commit notify
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send commit info to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          COMMITS_JSON: ${{ toJson(github.event.commits) }}
+        run: |
+          COMMITS=$(echo "$COMMITS_JSON" | jq -r '.[] | "[`\(.id[0:7])`](\(.url)) \(.message | split("\n")[0]) — \(.author.name)"' | head -c 3800)
+
+          PAYLOAD=$(jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg pusher "${{ github.actor }}" \
+            --arg commits "$COMMITS" \
+            --arg compare "${{ github.event.compare }}" \
+            '{
+              embeds: [{
+                title: ("📦 " + $repo + " — push в " + $branch),
+                description: $commits,
+                url: $compare,
+                color: 3066993,
+                footer: {text: ("автор push: " + $pusher)}
+              }]
+            }')
+
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
