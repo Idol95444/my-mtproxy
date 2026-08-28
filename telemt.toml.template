@@ -1,8 +1,11 @@
 [general]
 fast_mode = true
 use_middle_proxy = true
-# При старте ME-пул падал целиком (alive=0 для dc=2,3,-2): дефолтные 0 попыток
-# не переживают лавину переподключений после рестарта. Применяется только при старте.
+# ВНИМАНИЕ: не помогло. Отказ ME-пула при старте (alive=0 для dc=2,-2,3,-3)
+# воспроизводится и с 3, и с 0; на замерах 28.08.2026 корреляции с этим ключом нет
+# (0 -> 0 и 3 отказа, 3 -> 6 и 4 отказа). Пул сам добирает до 100% за ~минуту.
+# Оставлено как безвредное; настоящую причину искать в timeouts.me_one_retry /
+# me_one_timeout_ms / me_warmup_*, см. docs/Advanced_settings/TUNING.ru.md.
 me_init_retry_attempts = 3
 # Коннект к DC Telegram: на 10с ловили Connection timeout к 149.154.167.51
 tg_connect = 20
@@ -21,6 +24,11 @@ prefer = 4
 port = __PORT__
 listen_addr_ipv4 = "0.0.0.0"
 client_mss = "tspu"
+# client_mss=tspu -> MSS 92 на ВСЁ соединение, множитель сегментов ceil(1460/92)=16,
+# то есть 16-кратные накладные расходы на медиа. client_mss_bulk держит 92 только
+# на время ServerHello (что и смотрит DPI), а дальше отдаёт 1400: множитель падает
+# до 2. Подтверждено на живых сокетах: ss -tni показывает mss:1388/1400 вместо 92.
+client_mss_bulk = "1400"
 
 [server.api]
 enabled = true
@@ -32,10 +40,12 @@ tls_domain = "__TLS_DOMAIN__"
 mask = false
 mask_port = 8443
 tls_emulation = true
-# drop молча убивал и своих: живые пользователи попадали в beobachten.txt.
-# Значение mask здесь нерабочее — оно требует бэкенда на mask_port.
-# Допустимые: drop | mask | accept | reject_handshake
-unknown_sni_action = "accept"
+# Допустимые: drop | mask | accept | reject_handshake.
+# mask здесь нерабочее — требует живого бэкенда на mask_port.
+# accept документация не советует: «снижает защиту от активного пробинга».
+# reject_handshake — рекомендованный вариант: фатальный TLS-alert unrecognized_name,
+# на wire выглядит как nginx с ssl_reject_handshake on.
+unknown_sni_action = "reject_handshake"
 
 [access]
 replay_check_len = 65536

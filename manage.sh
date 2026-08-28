@@ -1206,6 +1206,14 @@ net.ipv4.tcp_base_mss = 1024
 # BBR: маршруты до РФ-абонентов теряют пакеты, cubic на потерях складывает окно
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+# Буферы сокетов: дефолтные 208 КБ не дают BBR раскрыть окно (скорость медиа).
+# Поднимаем ТОЛЬКО потолок — ядро растит буфер автотюнингом по BDP. Значения
+# по умолчанию не трогаем: на 2 ГБ RAM и ~1400 сокетах поднятый default
+# (официальный HIGH_LOAD-гайд предлагает 256 КБ) стоил бы до ~350 МБ.
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.ipv4.tcp_rmem = 4096 131072 8388608
+net.ipv4.tcp_wmem = 4096 16384 8388608
 EOF
     modprobe tcp_bbr 2>/dev/null || true
     echo tcp_bbr > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
