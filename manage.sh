@@ -555,7 +555,7 @@ User=telemt
 Group=telemt
 WorkingDirectory=/opt/telemt
 ExecStart=${TELEMT_BIN} ${TELEMT_CONF}
-Environment=RUST_LOG=error
+Environment=RUST_LOG=warn
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -1088,7 +1088,9 @@ action_security() {
     ufw --force enable >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
-    # hashlimit: burst-толерантный rate-limit (устойчиво 20 SYN/сек, всплеск до 60 на IP).
+    # hashlimit: burst-толерантный rate-limit (устойчиво 50 SYN/сек, всплеск до 200 на IP).
+    # На 20/60 счётчик DROP набрал 290k SYN против 3.97M ACCEPT (~7%): за одним
+    # адресом провайдерского NAT или VPN-выхода абоненты выбирают лимит сообща.
     # ВАЖНО: Telegram-клиент при загрузке медиа открывает до 8 параллельных
     # соединений на КАЖДЫЙ DC, а за VPN/VLESS-выходом сидят десятки юзеров
     # с ОДНОГО IP. Старая схема xt_recent (15 SYN/5с; потолок модуля — 20)
@@ -1104,10 +1106,11 @@ action_security() {
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200 -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p tcp --dport 443 --syn -j DROP 2>/dev/null || true
         # Сначала ACCEPT в пределах лимита (позиция 1), затем DROP сразу под ним
         # (позиция 2) — нет «окна», когда дропается весь новый SYN
-        iptables -I INPUT 1 -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT
+        iptables -I INPUT 1 -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200 -j ACCEPT
         iptables -I INPUT 2 -p tcp --dport 443 --syn -j DROP
         printf '%sok%s\n' "$C_GRN" "$C_RST"
     else
@@ -1195,7 +1198,17 @@ net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 30
 # telemt берёт backlog = min(своего, somaxconn) при старте
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
+# PMTU: client_mss=tspu зажимает MSS, а VPN-инкапсуляция у клиента режет путь
+# ещё сильнее. Без проб ядро не выходит из чёрной дыры PMTU — хендшейк MTProto
+# приходит нулевой длины (см. [expected_64_got_0] в /opt/telemt/beobachten.txt).
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_base_mss = 1024
+# BBR: маршруты до РФ-абонентов теряют пакеты, cubic на потерях складывает окно
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
+    modprobe tcp_bbr 2>/dev/null || true
+    echo tcp_bbr > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
@@ -1503,6 +1516,7 @@ action_uninstall() {
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 20/sec --hashlimit-burst 60 -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport 443 --syn -m hashlimit --hashlimit-name mtp443 --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200 -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -j DROP 2>/dev/null || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
