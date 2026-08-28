@@ -1,6 +1,11 @@
 [general]
 fast_mode = true
 use_middle_proxy = true
+# При старте ME-пул падал целиком (alive=0 для dc=2,3,-2): дефолтные 0 попыток
+# не переживают лавину переподключений после рестарта. Применяется только при старте.
+me_init_retry_attempts = 3
+# Коннект к DC Telegram: на 10с ловили Connection timeout к 149.154.167.51
+tg_connect = 20
 
 [general.modes]
 classic = false
@@ -27,7 +32,10 @@ tls_domain = "__TLS_DOMAIN__"
 mask = false
 mask_port = 8443
 tls_emulation = true
-unknown_sni_action = "drop"
+# drop молча убивал и своих: живые пользователи попадали в beobachten.txt.
+# Значение mask здесь нерабочее — оно требует бэкенда на mask_port.
+# Допустимые: drop | mask | accept | reject_handshake
+unknown_sni_action = "accept"
 
 [access]
 replay_check_len = 65536
