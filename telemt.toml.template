@@ -17,9 +17,12 @@ upstream_connect_budget_ms = 8000
 upstream_connect_retry_attempts = 3
 upstream_unhealthy_fail_threshold = 20
 me_reconnect_fast_retry_count = 32
-# DC2 у ME-пула — единственный эндпоинт (required=3 endpoint_count=1): запас теневых
-# writer'ов, чтобы потеря одного не валила DC в outage.
-me_single_endpoint_shadow_writers = 4
+# DC2 у ME-пула — единственный эндпоинт (endpoint_count=1). Замер 29.08 19:53-20:14:
+# shadow_writers=4 поднял required с 3 до 5 и не помог — все оставшиеся cutover'ы шли
+# от «Single-endpoint DC outage detected dc=2». Этот агрессивный режим выключаем: пусть
+# пул просто переподключает writer, не объявляя not-ready и не роняя всех в direct.
+me_single_endpoint_shadow_writers = 2
+me_single_endpoint_outage_mode_enabled = false
 
 [general.modes]
 classic = false
