@@ -957,12 +957,12 @@ if systemctl is-active --quiet telemt; then
     fi
 fi
 
-# Качели ME-пула: каждый fast_not_ready_fallback = cutover, который закрывает ВСЕ живые
-# сессии (Cutover affected ... closing client connection). Норма ночью 1-3/час, при
-# перегрузке хоста днём было 14-21/час — пользователи видят «то работает, то нет».
-CUTOVERS=$(journalctl -u telemt --since "1 hour ago" --no-pager -o cat 2>/dev/null | grep -c 'fast_not_ready_fallback')
+# Качели ME-пула: любой fallback_reason= (fast_not_ready / strict_grace) = cutover, который
+# закрывает ВСЕ живые сессии (Cutover affected ... closing client connection). До фикса
+# me2dc_fast=false было 14-25/час днём; после — 0 за 20 мин. Порог 5 — сигнал регресса.
+CUTOVERS=$(journalctl -u telemt --since "1 hour ago" --no-pager -o cat 2>/dev/null | grep -c 'fallback_reason=')
 if [[ "${CUTOVERS:-0}" -gt 5 ]]; then
-    ALERT="${ALERT}🔁 ME-пул: ${CUTOVERS} cutover за час (порог 5) — все сессии рвутся, хост перегружен (swap/CPU)\n"
+    ALERT="${ALERT}🔁 ME-пул: ${CUTOVERS} cutover за час (порог 5) — все сессии рвутся (провал ME-пула к DC2 дольше 6с grace)\n"
 fi
 
 if [[ -z "$ALERT" ]]; then
