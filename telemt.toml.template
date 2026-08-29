@@ -28,6 +28,12 @@ me_single_endpoint_outage_mode_enabled = false
 # сессий по расписанию, 4 раза в час. Реинит нужен только для подхвата новой карты ME;
 # делаем раз в 6 часов.
 me_reinit_every_secs = 21600
+# Настоящий механизм качелей (info-лог 29.08 21:31-21:53): ME-сторона DC2 массово
+# сбрасывает writer'ы, пул на 3-7 с проваливается ниже пола (alive=1 required=3), а
+# me2dc_fast мгновенно объявляет not-ready и cutover закрывает ВСЕ сессии; через
+# секунды всё возвращается. С me2dc_fast=false admission ждёт 6 с (strict grace) и
+# уходит в direct только если пул не восстановился — короткие провалы никого не рвут.
+me2dc_fast = false
 
 [general.modes]
 classic = false
