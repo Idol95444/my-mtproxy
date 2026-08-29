@@ -9,6 +9,17 @@ use_middle_proxy = true
 me_init_retry_attempts = 3
 # Коннект к DC Telegram: на 10с ловили Connection timeout к 149.154.167.51
 tg_connect = 20
+# Путь до DC2 (149.154.167.51) теряет ~35% SYN (mtr -T -P 443, 29.08.2026): единичные
+# таймауты connect за 3с ронял upstream в unhealthy (порог 5) -> ME-пул not-ready ->
+# cutover рвал ВСЕ живые сессии ~25 раз/час. Даём бюджет на ретрансмит SYN и терпим
+# больше отказов, прежде чем объявлять upstream мёртвым.
+upstream_connect_budget_ms = 8000
+upstream_connect_retry_attempts = 3
+upstream_unhealthy_fail_threshold = 20
+me_reconnect_fast_retry_count = 32
+# DC2 у ME-пула — единственный эндпоинт (required=3 endpoint_count=1): запас теневых
+# writer'ов, чтобы потеря одного не валила DC в outage.
+me_single_endpoint_shadow_writers = 4
 
 [general.modes]
 classic = false
