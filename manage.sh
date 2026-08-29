@@ -957,6 +957,14 @@ if systemctl is-active --quiet telemt; then
     fi
 fi
 
+# Качели ME-пула: каждый fast_not_ready_fallback = cutover, который закрывает ВСЕ живые
+# сессии (Cutover affected ... closing client connection). Норма ночью 1-3/час, при
+# перегрузке хоста днём было 14-21/час — пользователи видят «то работает, то нет».
+CUTOVERS=$(journalctl -u telemt --since "1 hour ago" --no-pager -o cat 2>/dev/null | grep -c 'fast_not_ready_fallback')
+if [[ "${CUTOVERS:-0}" -gt 5 ]]; then
+    ALERT="${ALERT}🔁 ME-пул: ${CUTOVERS} cutover за час (порог 5) — все сессии рвутся, хост перегружен (swap/CPU)\n"
+fi
+
 if [[ -z "$ALERT" ]]; then
     rm -f "$FLAG_FILE"
     exit 0
@@ -1117,6 +1125,22 @@ action_security() {
         printf '%sxt_hashlimit недоступен — пропущено%s\n' "$C_YLW" "$C_RST"
     fi
 
+    # Точечный бан: адреса из /etc/telemt/banlist.txt (по одному в строке). Цепочка
+    # стоит ПЕРЕД hashlimit ACCEPT — ufw-правила туда не дотягиваются (ACCEPT раньше
+    # ufw-цепочек), поэтому «ufw deny» для порта 443 здесь не работает.
+    # Кандидаты — лидеры beobachten.txt: один домашний IP давал 100k попыток/сутки.
+    printf '  Применяю бан-лист (/etc/telemt/banlist.txt)... '
+    iptables -N mtp443-ban 2>/dev/null || iptables -F mtp443-ban
+    BAN_N=0
+    if [[ -f /etc/telemt/banlist.txt ]]; then
+        while read -r ip; do
+            [[ -z "$ip" || "$ip" == \#* ]] && continue
+            iptables -A mtp443-ban -s "$ip" -j DROP && BAN_N=$((BAN_N+1))
+        done < /etc/telemt/banlist.txt
+    fi
+    iptables -C INPUT -p tcp --dport 443 -j mtp443-ban 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 443 -j mtp443-ban
+    printf '%s%s адресов%s\n' "$C_GRN" "$BAN_N" "$C_RST"
+
     # H1: ставим iptables-persistent и сохраняем правила (rate-limit + NAT-редирект),
     # иначе после reboot они теряются.
     printf '  Делаю правила iptables постоянными... '
@@ -1214,10 +1238,27 @@ net.core.rmem_max = 8388608
 net.core.wmem_max = 8388608
 net.ipv4.tcp_rmem = 4096 131072 8388608
 net.ipv4.tcp_wmem = 4096 16384 8388608
+# swap: на 2 ГБ RAM ядро с swappiness=60 выталкивало telemt в swap (135 МБ RSS
+# в swap при забитом swap) — стопоры по 20+ таймаутов connect к DC за секунду,
+# ME-пул уходил в not-ready и cutover рвал все сессии каждые 3-5 минут днём.
+vm.swappiness = 10
 EOF
     modprobe tcp_bbr 2>/dev/null || true
     echo tcp_bbr > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
+    printf '%sok%s\n' "$C_GRN" "$C_RST"
+
+    # journald: telemt при RUST_LOG=warn пишет ~150k строк/час, без лимита журнал
+    # разрастался до 1.5 ГБ и держал 100 МБ RSS на journald — на 2 ГБ RAM это swap.
+    printf '  Ограничиваю journald (200 МБ)... '
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/telemt.conf <<'EOF'
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=50M
+MaxRetentionSec=3day
+EOF
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     # Синхронизация часов: скью >30с ломает ME-хендшейк → пропадает спонсорский канал.
@@ -1519,6 +1560,8 @@ action_uninstall() {
     printf '%sok%s\n' "$C_GRN" "$C_RST"
 
     printf '  Убираю iptables rate-limit... '
+    iptables -D INPUT -p tcp --dport 443 -j mtp443-ban 2>/dev/null || true
+    iptables -F mtp443-ban 2>/dev/null || true; iptables -X mtp443-ban 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --rcheck --seconds 1 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --set -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtp443 --update --seconds 5 --hitcount 15 -j DROP 2>/dev/null || true
