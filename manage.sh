@@ -555,7 +555,7 @@ User=telemt
 Group=telemt
 WorkingDirectory=/opt/telemt
 ExecStart=${TELEMT_BIN} ${TELEMT_CONF}
-Environment=RUST_LOG=warn
+Environment=RUST_LOG=warn,telemt::maestro::admission=info,telemt::transport::middle_proxy=info
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

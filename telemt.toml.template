@@ -23,6 +23,11 @@ me_reconnect_fast_retry_count = 32
 # пул просто переподключает writer, не объявляя not-ready и не роняя всех в direct.
 me_single_endpoint_shadow_writers = 2
 me_single_endpoint_outage_mode_enabled = false
+# Плановый реинит пула раз в 900с (дефолт) каждый раз объявлял пул not-ready
+# («reinit proceeds with weighted quorum ... missing_dc=[203]») -> cutover -> обрыв всех
+# сессий по расписанию, 4 раза в час. Реинит нужен только для подхвата новой карты ME;
+# делаем раз в 6 часов.
+me_reinit_every_secs = 21600
 
 [general.modes]
 classic = false
