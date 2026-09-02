@@ -162,6 +162,19 @@ install_telemt_binary() {
     return 1
 }
 
+# Публичный IPv4 сервера — для бездоменного режима (ссылки на IP) и проверок DNS.
+detect_public_ip() {
+    local ip
+    ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+         curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
+         curl -s --max-time 5 https://icanhazip.com 2>/dev/null)
+    ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+    if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
+    fi
+    printf '%s' "$ip"
+}
+
 check_dns_health() {
     local domain="$1"
     local errors=0 warnings=0
@@ -169,10 +182,7 @@ check_dns_health() {
     printf '\n%sПроверка DNS и доступности:%s\n' "$C_BLD" "$C_RST"
 
     local server_ip
-    server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
-                curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
-                curl -s --max-time 5 https://icanhazip.com 2>/dev/null)
-    server_ip=$(printf '%s' "$server_ip" | tr -d '[:space:]')
+    server_ip=$(detect_public_ip)
     if [[ -z "$server_ip" ]]; then
         printf '  %s✗ Не удалось определить публичный IP сервера%s\n' "$C_RED" "$C_RST"
         errors=$((errors+1))
@@ -283,7 +293,11 @@ print_status() {
         local DOMAIN="" TLS_DOMAIN=""
         # shellcheck source=/dev/null
         source .env 2>/dev/null || true
-        [[ -n "${DOMAIN:-}"     ]] && domain="$DOMAIN"
+        if [[ -n "${DOMAIN:-}" ]]; then
+            domain="$DOMAIN"
+        else
+            domain="${C_DIM}без домена (ссылки на IP)${C_RST}"
+        fi
         [[ -n "${TLS_DOMAIN:-}" ]] && tls_mask="$TLS_DOMAIN"
     fi
 
@@ -403,11 +417,18 @@ action_deploy() {
         source .env 2>/dev/null || true
     fi
 
-    step "1/4" "Домен (A-запись должна указывать на этот VPS)"
-    DOMAIN=$(prompt_value "Введи домен" "$DOMAIN")
+    step "1/4" "Домен (A-запись должна указывать на этот VPS; пусто — режим без домена)"
+    printf '       %sБез домена%s ссылки строятся на публичный IP: РКН нечего резолвить,\n' "$C_BLD" "$C_RST"
+    printf '       но при смене IP придётся раздать новые ссылки.\n'
+    DOMAIN=$(prompt_value "Введи домен (пусто — без домена)" "$DOMAIN")
+    local LINK_HOST="$DOMAIN"
     if [[ -z "$DOMAIN" ]]; then
-        fail_inline "DOMAIN не может быть пустым"
-        pause; return
+        LINK_HOST=$(detect_public_ip)
+        if [[ -z "$LINK_HOST" ]]; then
+            fail_inline "Не удалось определить публичный IP сервера"
+            pause; return
+        fi
+        ok_inline "Режим без домена: ссылки будут на IP ${LINK_HOST}"
     fi
     printf '\n'
 
@@ -423,11 +444,21 @@ action_deploy() {
     printf '\n'
 
     step "3/4" "TLS-маскировка"
+    local USE_OWN_DOMAIN=false TLS_EMAIL="" CERT_MODE="http01"
+    if [[ -z "$DOMAIN" ]]; then
+        printf '       Без домена маскируемся под CDN-домен (свой сертификат выпустить нельзя).\n'
+        printf '       Ищу доступный CDN с этого VPS...\n'
+        if detect_tls_domain noisy; then
+            ok_inline "Авто-выбран: ${TLS_MASK_DOMAIN}"
+        else
+            fail_inline "Ни один CDN-домен недоступен с этого VPS — нет исходящего HTTPS?"
+            pause; return
+        fi
+    else
     printf '       %sСвоим доменом%s (%s) — рекомендуется: совместимо с VLESS/VPN-клиентами,\n' \
         "$C_BLD" "$C_RST" "$DOMAIN"
     printf '       telemt выпустит Let'\''s Encrypt cert + nginx:8443 + NAT-редирект.\n'
     printf '       %sCDN-домен%s — проще, но конфликтует с VPN-клиентами (sniff override).\n\n' "$C_BLD" "$C_RST"
-    local USE_OWN_DOMAIN=false TLS_EMAIL="" CERT_MODE="http01"
     if confirm "Маскировать своим доменом ${DOMAIN}?" Y; then
         USE_OWN_DOMAIN=true
         TLS_MASK_DOMAIN="$DOMAIN"
@@ -449,6 +480,7 @@ action_deploy() {
             pause; return
         fi
     fi
+    fi
     printf '\n'
 
     step "4/4" "Спонсорский канал (AD_TAG, пусто — пропустить)"
@@ -466,7 +498,7 @@ action_deploy() {
     AD_TAG="${NEW_AD_TAG}"
     printf '\n'
 
-    if ! check_dns_health "$DOMAIN"; then
+    if [[ -n "$DOMAIN" ]] && ! check_dns_health "$DOMAIN"; then
         printf '\n'
         if ! confirm "Продолжить несмотря на ошибки? (не рекомендую)" N; then
             return
@@ -474,7 +506,11 @@ action_deploy() {
     fi
 
     printf '\n%sИтого:%s\n' "$C_BLD" "$C_RST"
-    printf '  Домен:      %s\n' "$DOMAIN"
+    if [[ -n "$DOMAIN" ]]; then
+        printf '  Домен:      %s\n' "$DOMAIN"
+    else
+        printf '  Домен:      без домена (ссылки на IP %s)\n' "$LINK_HOST"
+    fi
     printf '  Секрет:     %s\n' "$BASE_SECRET"
     printf '  TLS-маска:  %s\n' "$TLS_MASK_DOMAIN"
     printf '  Порт:       %s\n' "$PROXY_PORT"
@@ -535,6 +571,7 @@ EOF
     printf '  Генерирую %s... ' "$TELEMT_CONF"
     sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
         -e "s/__TLS_DOMAIN__/$TLS_MASK_DOMAIN/g" \
+        -e "s/__PUBLIC_HOST__/$LINK_HOST/g" \
         -e "s/__PORT__/$PROXY_PORT/g" \
         -e "s/__API_PORT__/$PROXY_API_PORT/g" \
         telemt.toml.template > "$TELEMT_CONF"
@@ -628,8 +665,8 @@ EOF
 
     local hex_mask link_ee link_dd
     hex_mask=$(printf '%s' "$TLS_MASK_DOMAIN" | xxd -ps | tr -d '\n')
-    link_ee="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
-    link_dd="https://t.me/proxy?server=${DOMAIN}&port=${PROXY_PORT}&secret=dd${BASE_SECRET}"
+    link_ee="https://t.me/proxy?server=${LINK_HOST}&port=${PROXY_PORT}&secret=ee${BASE_SECRET}${hex_mask}"
+    link_dd="https://t.me/proxy?server=${LINK_HOST}&port=${PROXY_PORT}&secret=dd${BASE_SECRET}"
 
     printf '\n%s═══ Готово ═══%s\n\n' "$C_GRN$C_BLD" "$C_RST"
     printf '%sОсновная ссылка (FakeTLS):%s\n%s\n\n' "$C_BLD" "$C_RST" "$link_ee"
@@ -1340,9 +1377,10 @@ action_show_link() {
     # shellcheck source=/dev/null
     source .env
     local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
+    local host="${DOMAIN:-$(detect_public_ip)}"
 
-    if [[ -z "$DOMAIN" || -z "$mask" ]]; then
-        fail_inline "В .env нет DOMAIN или TLS_DOMAIN"
+    if [[ -z "$host" || -z "$mask" ]]; then
+        fail_inline "Не определить хост для ссылок: нет DOMAIN в .env и не определяется публичный IP"
         pause; return
     fi
 
@@ -1354,7 +1392,7 @@ action_show_link() {
         pause; return
     fi
 
-    printf '%s' "$api_data" | DOMAIN="$DOMAIN" PORT="$PROXY_PORT" MASK="$mask" python3 -c '
+    printf '%s' "$api_data" | DOMAIN="$host" PORT="$PROXY_PORT" MASK="$mask" python3 -c '
 import sys, json, os
 domain = os.environ["DOMAIN"]; port = os.environ["PORT"]; mask = os.environ["MASK"]
 hexmask = mask.encode().hex()
@@ -1496,8 +1534,10 @@ action_self_update() {
                 local DOMAIN="" BASE_SECRET="" TLS_DOMAIN=""
                 # shellcheck source=/dev/null
                 source .env
+                local link_host="${DOMAIN:-$(detect_public_ip)}"
                 sed -e "s/__BASE_SECRET__/$BASE_SECRET/g" \
                     -e "s/__TLS_DOMAIN__/${TLS_DOMAIN:-$TLS_MASK_DOMAIN}/g" \
+                    -e "s/__PUBLIC_HOST__/$link_host/g" \
                     -e "s/__PORT__/$PROXY_PORT/g" \
                     -e "s/__API_PORT__/$PROXY_API_PORT/g" \
                     telemt.toml.template > "$TELEMT_CONF"
@@ -2053,12 +2093,13 @@ _users_add() {
 
     local DOMAIN="" TLS_DOMAIN=""
     [[ -f .env ]] && source .env 2>/dev/null || true
+    local host="${DOMAIN:-$(detect_public_ip)}"
     local hex_mask
     hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
     printf '\n%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
-        "$C_GRN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret" "$hex_mask"
+        "$C_GRN$C_BLD" "$C_RST" "$host" "$PROXY_PORT" "$secret" "$hex_mask"
     printf '%sРезервная (dd):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=dd%s\n' \
-        "$C_CYN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret"
+        "$C_CYN$C_BLD" "$C_RST" "$host" "$PROXY_PORT" "$secret"
     pause
 }
 
@@ -2152,12 +2193,13 @@ print(s[2:34] if s[:2] in ('ee','dd') else s[:32])
 
     local DOMAIN="" TLS_DOMAIN=""
     [[ -f .env ]] && source .env 2>/dev/null || true
+    local host="${DOMAIN:-$(detect_public_ip)}"
     local hex_mask
     hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
     printf '%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
-        "$C_GRN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret" "$hex_mask"
+        "$C_GRN$C_BLD" "$C_RST" "$host" "$PROXY_PORT" "$secret" "$hex_mask"
     printf '%sРезервная (dd):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=dd%s\n' \
-        "$C_CYN$C_BLD" "$C_RST" "$DOMAIN" "$PROXY_PORT" "$secret"
+        "$C_CYN$C_BLD" "$C_RST" "$host" "$PROXY_PORT" "$secret"
     pause
 }
 

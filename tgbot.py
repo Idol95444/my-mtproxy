@@ -24,6 +24,25 @@ def load_env():
         pass
     return env
 
+_pub_ip_cache = {"ip": None, "ts": 0.0}
+
+def get_link_host(env):
+    """Хост для ссылок: DOMAIN из .env, а в бездоменном режиме — публичный IP VPS."""
+    domain = env.get("DOMAIN", "")
+    if domain:
+        return domain
+    if _pub_ip_cache["ip"] and time.time() - _pub_ip_cache["ts"] < 600:
+        return _pub_ip_cache["ip"]
+    for url in ("https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"):
+        try:
+            ip = urllib.request.urlopen(url, timeout=5).read().decode().strip()
+            if re.fullmatch(r"[0-9.]+", ip):
+                _pub_ip_cache.update(ip=ip, ts=time.time())
+                return ip
+        except Exception:
+            pass
+    return "?"
+
 cfg       = load_env()
 BOT_TOKEN = cfg.get("BOT_TOKEN", "")
 CHAT_IDS  = {c.strip() for c in cfg.get("BOT_CHAT_ID", "").split(",") if c.strip()}
@@ -275,7 +294,7 @@ def build_user_detail(name):
 
 def build_user_links(name):
     c        = load_env()
-    domain   = c.get("DOMAIN", "?")
+    domain   = get_link_host(c)
     tls_dom  = c.get("TLS_DOMAIN", "")
     port     = c.get("PROXY_PORT", "443")
     hex_mask = tls_dom.encode().hex()
@@ -552,7 +571,7 @@ def cmd_adduser(chat_id, args):
             send(chat_id, f"❌ Ошибка: {e}"); return
 
     c        = load_env()
-    domain   = c.get("DOMAIN", "?")
+    domain   = get_link_host(c)
     tls_dom  = c.get("TLS_DOMAIN", "")
     port     = c.get("PROXY_PORT", "443")
     hex_mask = tls_dom.encode().hex()
