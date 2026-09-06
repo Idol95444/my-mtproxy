@@ -43,6 +43,143 @@ def get_link_host(env):
             pass
     return "?"
 
+# ── Несколько IP: определение, привязка пользователей ────────────────────────
+
+HOSTS_MAP = "/opt/telemt/user-hosts.json"
+
+# Приватные/служебные диапазоны, которые никогда не раздаём в ссылках.
+_PRIVATE_RE = re.compile(
+    r"^(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|"
+    r"22[4-9]\.|2[3-5]\d\.)")
+
+_hosts_cache = {"list": [], "ts": 0.0}
+
+def primary_host():
+    """Основной хост: домен, иначе PRIMARY_HOST из .env, иначе автоопределение."""
+    c = load_env()
+    if c.get("DOMAIN"):
+        return c["DOMAIN"]
+    return (c.get("PRIMARY_HOST") or "").strip() or get_link_host(c)
+
+def detect_hosts():
+    """Публичные IPv4 сервера, основной первым. В доменном режиме — только домен."""
+    c = load_env()
+    if c.get("DOMAIN"):
+        return [c["DOMAIN"]]
+    now = time.time()
+    if _hosts_cache["list"] and now - _hosts_cache["ts"] < 60:
+        found = list(_hosts_cache["list"])
+    else:
+        found = []
+        try:
+            r = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                               capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    ip = parts[3].split("/")[0]
+                    if not _PRIVATE_RE.match(ip):
+                        found.append(ip)
+        except Exception:
+            pass
+        found = sorted(set(found))
+        _hosts_cache.update(list=found, ts=now)
+    primary = primary_host()
+    if primary in found:
+        found.remove(primary)
+    return ([primary] if primary else []) + found
+
+def load_host_map():
+    try:
+        with open(HOSTS_MAP) as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+def save_host_map(m):
+    try:
+        os.makedirs(os.path.dirname(HOSTS_MAP), exist_ok=True)
+        tmp = HOSTS_MAP + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(m, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, HOSTS_MAP)
+        return True
+    except Exception:
+        return False
+
+def user_host(name):
+    """IP, закреплённый за пользователем. Если такого IP на сервере уже нет — основной."""
+    h = load_host_map().get(name)
+    return h if h and h in detect_hosts() else primary_host()
+
+def set_user_host(name, host):
+    """Привязка к основному не хранится: такой юзер сам переезжает при смене основного IP."""
+    m = load_host_map()
+    if host == primary_host():
+        m.pop(name, None)
+    else:
+        m[name] = host
+    return save_host_map(m)
+
+def forget_user_host(name):
+    m = load_host_map()
+    if m.pop(name, None) is not None:
+        save_host_map(m)
+
+def make_links(secret, host, c=None):
+    c        = c or load_env()
+    port     = c.get("PROXY_PORT", "443")
+    hex_mask = c.get("TLS_DOMAIN", "").encode().hex()
+    ee = f"https://t.me/proxy?server={host}&port={port}&secret=ee{secret}{hex_mask}"
+    dd = f"https://t.me/proxy?server={host}&port={port}&secret=dd{secret}"
+    return ee, dd
+
+# ── Доступность IP из РФ (check-host.net) ────────────────────────────────────
+
+RU_NODES  = ("ru2.node.check-host.net", "ru3.node.check-host.net")
+# check-host.net отдаёт 403 на дефолтный User-Agent urllib — нужен браузерный.
+CH_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+_ru_cache = {"data": {}, "ts": 0.0}
+
+def check_ru_reachability(hosts, port="443", ttl=300):
+    """{ip: {'ru2': True/False, ...}}. Пустой словарь у IP = проверить не удалось."""
+    now = time.time()
+    if (_ru_cache["data"] and now - _ru_cache["ts"] < ttl
+            and set(hosts) <= set(_ru_cache["data"])):
+        return _ru_cache["data"]
+    rids = {}
+    for h in hosts:
+        q = urllib.parse.urlencode(
+            [("host", f"{h}:{port}")] + [("node", n) for n in RU_NODES])
+        try:
+            req = urllib.request.Request("https://check-host.net/check-tcp?" + q,
+                                         headers=CH_HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rids[h] = json.load(r).get("request_id")
+        except Exception:
+            rids[h] = None
+    time.sleep(12)   # узлам нужно время на попытку подключения
+    result = {}
+    for h, rid in rids.items():
+        result[h] = {}
+        if not rid:
+            continue
+        try:
+            req = urllib.request.Request(f"https://check-host.net/check-result/{rid}",
+                                         headers=CH_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+        except Exception:
+            continue
+        for node, val in (data or {}).items():
+            if not val:
+                continue
+            result[h][node.split(".")[0]] = any(
+                isinstance(i, dict) and "time" in i for i in val if i)
+    _ru_cache.update(data=result, ts=now)
+    return result
+
 cfg       = load_env()
 BOT_TOKEN = cfg.get("BOT_TOKEN", "")
 CHAT_IDS  = {c.strip() for c in cfg.get("BOT_CHAT_ID", "").split(",") if c.strip()}
@@ -122,6 +259,7 @@ def kb_main():
     return kb(
         [("📊 Статистика", "stats"),   ("👥 Пользователи", "users")],
         [("🖥 Мониторинг",  "monitor"), ("⚙️ Управление",   "mgmt_hint")],
+        [("🌐 IP-адреса",   "ips")],
     )
 
 def kb_stats():
@@ -156,6 +294,7 @@ def kb_user_detail(name, enabled):
          ("📊 20 ГБ",       f"quota:{name}:20")],
         [("♾ Снять квоту",  f"quota:{name}:0"),
          ("🗑 Удалить",      f"user_del:{name}")],
+        [("🌐 Сменить IP",  f"hostpick:{name}")],
         [("◀️ Пользователи", "users")],
     )
 
@@ -164,6 +303,13 @@ def kb_monitor():
         [("🔄 Обновить", "monitor")],
         [("◀️ Главная",  "main")],
     )
+
+def kb_host_pick(name, action, back="users"):
+    primary = primary_host()
+    rows = [[(("⭐ " if h == primary else "") + h, f"{action}:{name}:{h}")]
+            for h in detect_hosts()]
+    rows.append([("◀️ Отмена", back)])
+    return kb(*rows)
 
 def kb_confirm_del(name):
     return kb(
@@ -289,15 +435,50 @@ def build_user_detail(name):
         f"Уник. IP:   {ips}\n"
         f"Трафик:     {gb:.2f} ГБ\n"
         f"Квота:      {f'{quota/1024**3:.0f} ГБ' if quota else 'без лимита'}\n"
-        f"Действует:  до {exp}"
+        f"Действует:  до {exp}\n"
+        f"IP выдачи:  {user_host(name)}"
+        + ("  ⭐" if user_host(name) == primary_host() else "")
     ), kb_user_detail(name, enabled)
 
+def build_ips():
+    hosts   = detect_hosts()
+    primary = primary_host()
+    if not hosts:
+        return "❌ Не удалось определить ни одного публичного IP", kb([("◀️ Главная", "main")])
+
+    d     = api_get("/v1/users")
+    users = d.get("data", []) if d.get("ok") else []
+    by_host = {}
+    for u in users:
+        by_host.setdefault(user_host(u["username"]), []).append(u["username"])
+
+    ru    = check_ru_reachability(hosts)
+    parts = ["🌐 <b>IP-адреса сервера</b>"]
+    for h in hosts:
+        per = ru.get(h, {})
+        ok  = sorted(n for n, v in per.items() if v)
+        bad = sorted(n for n, v in per.items() if not v)
+        if not per:
+            status = "❔ проверить не удалось"
+        elif not bad:
+            status = f"✅ из РФ отвечает ({', '.join(ok)})"
+        elif not ok:
+            status = f"⛔️ из РФ НЕ отвечает ({', '.join(bad)}) — похоже на бан ТСПУ"
+        else:
+            status = f"⚠️ частично: ок {', '.join(ok)}, таймаут {', '.join(bad)}"
+        who = by_host.get(h, [])
+        block = (f"<b>{h}</b>{' ⭐ основной' if h == primary else ''}\n"
+                 f"  {status}\n"
+                 f"  Пользователей: {len(who)}")
+        if who:
+            block += "\n  " + ", ".join(who[:10]) + ("…" if len(who) > 10 else "")
+        parts.append(block)
+    parts.append("<i>Проверка через check-host.net: ru2 — Москва, ru3 — СПб.\n"
+                 "Результат кэшируется на 5 минут.</i>")
+    return "\n\n".join(parts), kb([("🔄 Обновить", "ips")], [("◀️ Главная", "main")])
+
 def build_user_links(name):
-    c        = load_env()
-    domain   = get_link_host(c)
-    tls_dom  = c.get("TLS_DOMAIN", "")
-    port     = c.get("PROXY_PORT", "443")
-    hex_mask = tls_dom.encode().hex()
+    c = load_env()
 
     d = api_get("/v1/users")
     if not d.get("ok"):
@@ -312,13 +493,16 @@ def build_user_links(name):
     s      = tls_links[0].split("secret=")[-1]
     secret = s[2:34] if s[:2] in ("ee", "dd") else s[:32]
 
-    ee = f"https://t.me/proxy?server={domain}&port={port}&secret=ee{secret}{hex_mask}"
-    dd = f"https://t.me/proxy?server={domain}&port={port}&secret=dd{secret}"
+    host   = user_host(name)
+    ee, dd = make_links(secret, host, c)
+    mark   = " ⭐ основной" if host == primary_host() else ""
     return (
-        f"🔗 <b>Ссылки {name}</b>\n\n"
+        f"🔗 <b>Ссылки {name}</b>\n"
+        f"IP: <b>{host}</b>{mark}\n\n"
         f"<b>FakeTLS (основная):</b>\n<code>{ee}</code>\n\n"
         f"<b>dd (резерв):</b>\n<code>{dd}</code>"
-    ), kb([("◀️ Назад", f"user_detail:{name}")])
+    ), kb([("🌐 Сменить IP", f"hostpick:{name}")],
+          [("◀️ Назад",      f"user_detail:{name}")])
 
 def build_monitor():
     lines = ["🖥 <b>Мониторинг сервера</b>\n"]
@@ -510,12 +694,35 @@ def on_callback(cb_id, chat_id, msg_id, data):
                  f"Юзер НЕ выключен, чтобы не вызвать шторм переподключений.",
                  kb([("◀️ Пользователи", "users")]))
             return
+        forget_user_host(name)
         text, markup = build_users()
+        edit(chat_id, msg_id, text, markup)
+
+    elif data == "ips":
+        text, markup = build_ips()
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("addip:"):
+        _, name, host = data.split(":", 2)
+        text, markup = create_user(name, host)
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("hostpick:"):
+        name = data.split(":", 1)[1]
+        edit(chat_id, msg_id, f"На каком IP выдать <b>{name}</b>?",
+             kb_host_pick(name, "sethost", back=f"user_detail:{name}"))
+
+    elif data.startswith("sethost:"):
+        _, name, host = data.split(":", 2)
+        set_user_host(name, host)
+        text, markup = build_user_links(name)
         edit(chat_id, msg_id, text, markup)
 
     elif data == "user_add_hint":
         edit(chat_id, msg_id,
-             "➕ Напиши:\n\n<code>/adduser имя</code>",
+             "➕ Напиши:\n\n<code>/adduser имя</code>\n\n"
+             "Если IP несколько — бот спросит, на каком выдать.\n"
+             "Можно сразу: <code>/adduser имя 1.2.3.4</code>",
              kb([("◀️ Назад", "users")]))
 
 # ── Text command handlers ─────────────────────────────────────────────────────
@@ -531,15 +738,18 @@ def cmd_users(chat_id, _):
     text, markup = build_users()
     send(chat_id, text, markup)
 
-def cmd_adduser(chat_id, args):
-    if not args:
-        send(chat_id, "Использование: /adduser &lt;имя&gt;"); return
-    name    = args[0]
+def create_user(name, host):
+    """Создаёт пользователя и закрепляет за ним IP. Возвращает (text, markup)."""
     if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', name):
-        send(chat_id, "❌ Имя пользователя: только латиница, цифры, `-`, `_`, до 32 символов"); return
-    secret  = secrets.token_hex(16)
-    cfg     = load_env()
-    ad_tag  = cfg.get("AD_TAG") or None
+        return ("❌ Имя пользователя: только латиница, цифры, `-`, `_`, до 32 символов",
+                kb([("◀️ Пользователи", "users")]))
+    if host not in detect_hosts():
+        return (f"❌ IP {host} на сервере не найден",
+                kb([("◀️ Пользователи", "users")]))
+
+    secret = secrets.token_hex(16)
+    cfg    = load_env()
+    ad_tag = cfg.get("AD_TAG") or None
 
     payload = {"username": name, "secret": secret}
     if ad_tag:
@@ -547,11 +757,12 @@ def cmd_adduser(chat_id, args):
 
     r = api_call("POST", "/v1/users", payload)
     if not r.get("ok"):
-        toml = load_env().get("TELEMT_CONF", "/etc/telemt/telemt.toml")
+        toml = cfg.get("TELEMT_CONF", "/etc/telemt/telemt.toml")
         try:
             with open(toml) as f: content = f.read()
             if f'{name} = ' in content:
-                send(chat_id, f"❌ Пользователь {name} уже существует"); return
+                return (f"❌ Пользователь {name} уже существует",
+                        kb([("◀️ Пользователи", "users")]))
             if "[access.users]" in content:
                 content = content.replace("[access.users]",
                                           f"[access.users]\n{name} = \"{secret}\"", 1)
@@ -568,20 +779,44 @@ def cmd_adduser(chat_id, args):
                            check=True, capture_output=True)
             time.sleep(3)
         except Exception as e:
-            send(chat_id, f"❌ Ошибка: {e}"); return
+            return (f"❌ Ошибка: {e}", kb([("◀️ Пользователи", "users")]))
 
-    c        = load_env()
-    domain   = get_link_host(c)
-    tls_dom  = c.get("TLS_DOMAIN", "")
-    port     = c.get("PROXY_PORT", "443")
-    hex_mask = tls_dom.encode().hex()
-    ee = f"https://t.me/proxy?server={domain}&port={port}&secret=ee{secret}{hex_mask}"
-    dd = f"https://t.me/proxy?server={domain}&port={port}&secret=dd{secret}"
-    send(chat_id,
-         f"✅ <b>{name}</b> создан\n\n"
-         f"<b>FakeTLS:</b>\n<code>{ee}</code>\n\n"
-         f"<b>dd:</b>\n<code>{dd}</code>",
-         kb([("👥 Пользователи", "users")]))
+    set_user_host(name, host)
+    ee, dd = make_links(secret, host)
+    mark   = " ⭐ основной" if host == primary_host() else ""
+    return (f"✅ <b>{name}</b> создан\n"
+            f"IP: <b>{host}</b>{mark}\n\n"
+            f"<b>FakeTLS:</b>\n<code>{ee}</code>\n\n"
+            f"<b>dd:</b>\n<code>{dd}</code>",
+            kb([("🌐 Сменить IP",   f"hostpick:{name}")],
+                [("👥 Пользователи", "users")]))
+
+def cmd_adduser(chat_id, args):
+    if not args:
+        send(chat_id, "Использование: /adduser &lt;имя&gt; [IP]"); return
+    name  = args[0]
+    hosts = detect_hosts()
+
+    # IP задан прямо в команде
+    if len(args) > 1:
+        if args[1] not in hosts:
+            send(chat_id, f"❌ IP <b>{args[1]}</b> на сервере не найден.\n"
+                          f"Доступны: {', '.join(hosts) or '—'}"); return
+        text, markup = create_user(name, args[1])
+        send(chat_id, text, markup); return
+
+    # Один хост — спрашивать нечего
+    if len(hosts) < 2:
+        text, markup = create_user(name, hosts[0] if hosts else primary_host())
+        send(chat_id, text, markup); return
+
+    if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', name):
+        send(chat_id, "❌ Имя пользователя: только латиница, цифры, `-`, `_`, до 32 символов"); return
+    send(chat_id, f"На каком IP выдать <b>{name}</b>?", kb_host_pick(name, "addip"))
+
+def cmd_ips(chat_id, _):
+    text, markup = build_ips()
+    send(chat_id, text, markup)
 
 def cmd_link(chat_id, args):
     if not args:
@@ -628,8 +863,9 @@ def cmd_help(chat_id, _):
          "/stats — статистика прокси\n"
          "/users — список пользователей\n"
          "/monitor — мониторинг сервера\n"
-         "/adduser &lt;имя&gt; — добавить пользователя\n"
+         "/adduser &lt;имя&gt; [IP] — добавить пользователя\n"
          "/link &lt;user&gt; — ссылки пользователя\n"
+         "/ips — IP сервера и их доступность из РФ\n"
          "/quota &lt;user&gt; &lt;ГБ&gt; — квота (0 = снять)\n"
          "/block &lt;IP&gt; — заблокировать IP",
          kb_main())
@@ -642,6 +878,7 @@ COMMANDS = {
     "monitor": cmd_monitor,
     "adduser": cmd_adduser,
     "link":    cmd_link,
+    "ips":     cmd_ips,
     "quota":   cmd_quota,
     "block":   cmd_block,
 }

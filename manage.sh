@@ -175,6 +175,99 @@ detect_public_ip() {
     printf '%s' "$ip"
 }
 
+# Все публичные IPv4 этого сервера. Основной (PRIMARY_HOST из .env) — первым.
+detect_all_public_ips() {
+    local all primary=""
+    all=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+          | grep -vE '^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|22[4-9]\.|2[3-5][0-9]\.)' \
+          | sort -u || true)
+    [[ -z "$all" ]] && return 0
+    primary=$(primary_link_host)
+    if [[ -n "$primary" ]] && printf '%s\n' "$all" | grep -qx "$primary"; then
+        printf '%s\n' "$primary"
+        printf '%s\n' "$all" | grep -vx "$primary" || true
+    else
+        printf '%s\n' "$all"
+    fi
+}
+
+# Основной хост для ссылок: домен → PRIMARY_HOST из .env → автоопределение.
+primary_link_host() {
+    local DOMAIN="" PRIMARY_HOST=""
+    if [[ -f "$SCRIPT_DIR/.env" ]]; then
+        # shellcheck source=/dev/null
+        source "$SCRIPT_DIR/.env" 2>/dev/null || true
+    fi
+    if [[ -n "$DOMAIN" ]]; then printf '%s' "$DOMAIN"; return 0; fi
+    if [[ -n "$PRIMARY_HOST" ]]; then printf '%s' "$PRIMARY_HOST"; return 0; fi
+    detect_public_ip
+}
+
+# IP, закреплённый за пользователем ботом. Если такого IP уже нет — основной.
+user_link_host() {
+    local name="$1" host="" all=""
+    host=$(python3 -c '
+import json, sys
+try:
+    with open("/opt/telemt/user-hosts.json") as f:
+        print(json.load(f).get(sys.argv[1], ""))
+except Exception:
+    print("")
+' "$name" 2>/dev/null || true)
+    all=$(detect_all_public_ips)
+    if [[ -n "$host" ]] && printf '%s\n' "$all" | grep -qx "$host"; then
+        printf '%s' "$host"
+    else
+        primary_link_host
+    fi
+}
+
+# Записать привязку пользователя к IP в карту, которую читает бот.
+# Привязку к основному IP не храним: такой юзер сам переезжает при смене основного.
+set_user_link_host() {
+    local name="$1" host="$2" primary
+    primary=$(primary_link_host)
+    python3 -c '
+import json, os, sys
+path, name, host, primary = sys.argv[1:5]
+try:
+    with open(path) as f:
+        m = json.load(f)
+    if not isinstance(m, dict):
+        m = {}
+except Exception:
+    m = {}
+if host == primary:
+    m.pop(name, None)
+else:
+    m[name] = host
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(m, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+' /opt/telemt/user-hosts.json "$name" "$host" "$primary" 2>/dev/null || true
+}
+
+# Снять привязку удалённого пользователя, чтобы карта не копила мусор.
+forget_user_link_host() {
+    python3 -c '
+import json, os, sys
+path, name = sys.argv[1:3]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except Exception:
+    sys.exit(0)
+if not isinstance(m, dict) or m.pop(name, None) is None:
+    sys.exit(0)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(m, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+' /opt/telemt/user-hosts.json "$1" 2>/dev/null || true
+}
+
 check_dns_health() {
     local domain="$1"
     local errors=0 warnings=0
@@ -423,12 +516,38 @@ action_deploy() {
     DOMAIN=$(prompt_value "Введи домен (пусто — без домена)" "$DOMAIN")
     local LINK_HOST="$DOMAIN"
     if [[ -z "$DOMAIN" ]]; then
-        LINK_HOST=$(detect_public_ip)
+        local all_ips ip_count
+        all_ips=$(detect_all_public_ips)
+        ip_count=$(printf '%s\n' "$all_ips" | grep -c . || true)
+
+        if [[ "${ip_count:-0}" -gt 1 ]]; then
+            # Несколько публичных IP: явно помечаем основной. Он идёт в public_host
+            # telemt и становится хостом по умолчанию для новых пользователей бота;
+            # остальные остаются доступны — telemt слушает 0.0.0.0, секреты общие.
+            printf '\n       %sНа сервере несколько публичных IP:%s\n' "$C_BLD" "$C_RST"
+            local n=0 line
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                n=$((n+1))
+                printf '         %s%d)%s %s\n' "$C_CYN" "$n" "$C_RST" "$line"
+            done <<< "$all_ips"
+            printf '       %sОсновной идёт в ссылки по умолчанию; остальные бот раздаёт по выбору.%s\n' \
+                "$C_DIM" "$C_RST"
+            local choice
+            choice=$(prompt_value "Номер основного IP" "1")
+            LINK_HOST=$(printf '%s\n' "$all_ips" | sed -n "${choice}p")
+            if [[ -z "$LINK_HOST" ]]; then
+                LINK_HOST=$(printf '%s\n' "$all_ips" | sed -n '1p')
+            fi
+        else
+            LINK_HOST=$(detect_public_ip)
+        fi
+
         if [[ -z "$LINK_HOST" ]]; then
             fail_inline "Не удалось определить публичный IP сервера"
             pause; return
         fi
-        ok_inline "Режим без домена: ссылки будут на IP ${LINK_HOST}"
+        ok_inline "Режим без домена: основной IP ${LINK_HOST}"
     fi
     printf '\n'
 
@@ -510,6 +629,9 @@ action_deploy() {
         printf '  Домен:      %s\n' "$DOMAIN"
     else
         printf '  Домен:      без домена (ссылки на IP %s)\n' "$LINK_HOST"
+        local other_ips
+        other_ips=$(detect_all_public_ips | grep -vx "$LINK_HOST" | tr '\n' ' ' || true)
+        [[ -n "${other_ips// /}" ]] && printf '  Ещё IP:     %s(раздаются ботом по выбору)\n' "$other_ips"
     fi
     printf '  Секрет:     %s\n' "$BASE_SECRET"
     printf '  TLS-маска:  %s\n' "$TLS_MASK_DOMAIN"
@@ -526,6 +648,7 @@ action_deploy() {
 DOMAIN=$DOMAIN
 BASE_SECRET=$BASE_SECRET
 TLS_DOMAIN=$TLS_MASK_DOMAIN
+PRIMARY_HOST=$LINK_HOST
 EOF
     [[ -n "${AD_TAG:-}" ]] && printf 'AD_TAG=%s\n' "$AD_TAG" >> .env
     chmod 600 .env
@@ -1002,6 +1125,77 @@ if [[ "${CUTOVERS:-0}" -gt 5 ]]; then
     ALERT="${ALERT}🔁 ME-пул: ${CUTOVERS} cutover за час (порог 5) — все сессии рвутся (провал ME-пула к DC2 дольше 6с grace)\n"
 fi
 
+# ── Доступность каждого публичного IP из РФ (check-host.net) ────────────────
+# Бан ТСПУ выглядит как таймаут TCP с ru-узлов при живом IP из-за границы.
+# Раскатка постепенная (Москва раньше СПб), поэтому различаем «частично» и «полностью».
+# Проверяем не чаще раза в час: check-host — внешний сервис, его незачем долбить.
+IP_STATE="/var/lib/telemt-ip-state"
+IP_STAMP="/var/lib/telemt-ip-checked"
+
+check_ip_ru() {
+    local ip="$1" rid
+    rid=$(curl -s --max-time 10 -H "Accept: application/json" -A "Mozilla/5.0" \
+          "https://check-host.net/check-tcp?host=${ip}:443&node=ru2.node.check-host.net&node=ru3.node.check-host.net" \
+          2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("request_id",""))' 2>/dev/null || true)
+    if [[ -z "$rid" ]]; then printf 'unknown'; return; fi
+    sleep 12
+    curl -s --max-time 15 -H "Accept: application/json" -A "Mozilla/5.0" \
+        "https://check-host.net/check-result/${rid}" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin) or {}
+except Exception:
+    print("unknown"); raise SystemExit
+ok = bad = 0
+for node, val in d.items():
+    if not val:
+        continue
+    if any(isinstance(i, dict) and "time" in i for i in val if i):
+        ok += 1
+    else:
+        bad += 1
+print("unknown" if ok + bad == 0 else "ok" if bad == 0 else "down" if ok == 0 else "partial")
+' 2>/dev/null || printf 'unknown'
+}
+
+ip_rank() {
+    case "$1" in
+        ok)      printf '0' ;;
+        partial) printf '1' ;;
+        down)    printf '2' ;;
+        *)       printf '-1' ;;
+    esac
+}
+
+NOW_TS=$(date +%s)
+LAST_TS=$(cat "$IP_STAMP" 2>/dev/null || echo 0)
+if (( NOW_TS - LAST_TS >= 3600 )); then
+    mkdir -p /var/lib
+    date +%s > "$IP_STAMP"
+    PUB_IPS=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+              | grep -vE '^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|22[4-9]\.|2[3-5][0-9]\.)' \
+              | sort -u || true)
+    NEW_STATE=""
+    for ip in $PUB_IPS; do
+        st=$(check_ip_ru "$ip")
+        NEW_STATE="${NEW_STATE}${ip} ${st}"$'\n'
+        prev=$(grep -m1 "^${ip} " "$IP_STATE" 2>/dev/null | awk '{print $2}' || true)
+        [[ -z "$prev" ]] && prev="unknown"
+        # Сообщаем только о смене состояния, и только между известными значениями.
+        if [[ "$st" != "unknown" && "$prev" != "unknown" && "$st" != "$prev" ]]; then
+            if (( $(ip_rank "$st") > $(ip_rank "$prev") )); then
+                case "$st" in
+                    down)    tg_send "🚨 <b>IP ${ip}</b> больше не отвечает из РФ (было: ${prev}) — похоже на бан ТСПУ. Пользователей с этого IP надо переводить." ;;
+                    partial) tg_send "⚠️ <b>IP ${ip}</b> отвечает из РФ частично (было: ${prev}) — вероятно, началась раскатка блокировки." ;;
+                esac
+            else
+                tg_send "✅ <b>IP ${ip}</b> снова отвечает из РФ (${prev} → ${st})."
+            fi
+        fi
+    done
+    [[ -n "$NEW_STATE" ]] && printf '%s' "$NEW_STATE" > "$IP_STATE"
+fi
+
 if [[ -z "$ALERT" ]]; then
     rm -f "$FLAG_FILE"
     exit 0
@@ -1377,7 +1571,7 @@ action_show_link() {
     # shellcheck source=/dev/null
     source .env
     local mask="${TLS_DOMAIN:-$TLS_MASK_DOMAIN}"
-    local host="${DOMAIN:-$(detect_public_ip)}"
+    local host; host=$(primary_link_host)
 
     if [[ -z "$host" || -z "$mask" ]]; then
         fail_inline "Не определить хост для ссылок: нет DOMAIN в .env и не определяется публичный IP"
@@ -1392,27 +1586,41 @@ action_show_link() {
         pause; return
     fi
 
-    printf '%s' "$api_data" | DOMAIN="$host" PORT="$PROXY_PORT" MASK="$mask" python3 -c '
+    local all_ips; all_ips=$(detect_all_public_ips | tr '\n' ',' || true)
+    printf '%s' "$api_data" | DOMAIN="$host" PORT="$PROXY_PORT" MASK="$mask" ALL_IPS="$all_ips" python3 -c '
 import sys, json, os
 domain = os.environ["DOMAIN"]; port = os.environ["PORT"]; mask = os.environ["MASK"]
+known = [x for x in os.environ.get("ALL_IPS", "").split(",") if x]
 hexmask = mask.encode().hex()
-GRN="\033[32m"; CYN="\033[36m"; BLD="\033[1m"; RST="\033[0m"
+GRN="\033[32m"; CYN="\033[36m"; BLD="\033[1m"; DIM="\033[2m"; RST="\033[0m"
+try:
+    with open("/opt/telemt/user-hosts.json") as f:
+        pinned = json.load(f)
+except Exception:
+    pinned = {}
 for u in json.load(sys.stdin).get("data", []):
     tls = u.get("links", {}).get("tls", [])
     if not tls:
         continue
     s = tls[0].split("secret=")[-1]
     secret = s[2:34] if s[:2] in ("ee", "dd") else s[:32]
-    ee = f"https://t.me/proxy?server={domain}&port={port}&secret=ee{secret}{hexmask}"
-    dd = f"https://t.me/proxy?server={domain}&port={port}&secret=dd{secret}"
     name = u["username"]
+    # Хост пользователя: закреплённый ботом, если он ещё есть на сервере, иначе основной.
+    h = pinned.get(name)
+    if not h or (known and h not in known):
+        h = domain
+    ee = f"https://t.me/proxy?server={h}&port={port}&secret=ee{secret}{hexmask}"
+    dd = f"https://t.me/proxy?server={h}&port={port}&secret=dd{secret}"
     icon = "" if u.get("enabled", True) else " (выключен)"
-    print(f"{BLD}{name}{icon}{RST}")
+    star = " *" if h == domain else ""
+    print(f"{BLD}{name}{icon}{RST}  {DIM}IP: {h}{star}{RST}")
     print(f"  {GRN}FakeTLS:{RST} {ee}")
     print(f"  {CYN}dd:     {RST} {dd}")
     print()
 '
     printf '%sМаска ee: %s | dd-режим работает с любым VPN-клиентом%s\n' "$C_DIM" "$mask" "$C_RST"
+    printf '%s* — основной IP. Привязку меняет бот: карточка юзера → «Сменить IP».%s\n' "$C_DIM" "$C_RST"
+    printf '%sIP сервера: %s%s\n' "$C_DIM" "$(detect_all_public_ips | tr '\n' ' ')" "$C_RST"
     pause
 }
 
@@ -2041,6 +2249,29 @@ _users_add() {
         fail_inline "Некорректное имя"; sleep 2; return
     fi
 
+    # Несколько публичных IP — спрашиваем, на каком выдать (как это делает бот).
+    local pick_host="" all_ips ip_count
+    all_ips=$(detect_all_public_ips)
+    ip_count=$(printf '%s\n' "$all_ips" | grep -c . || true)
+    if [[ "${ip_count:-0}" -gt 1 ]]; then
+        printf '\n  %sIP для этого пользователя:%s\n' "$C_BLD" "$C_RST"
+        local n=0 line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            n=$((n+1))
+            if [[ "$n" == 1 ]]; then
+                printf '    %s%d)%s %s %s(основной)%s\n' "$C_CYN" "$n" "$C_RST" "$line" "$C_DIM" "$C_RST"
+            else
+                printf '    %s%d)%s %s\n' "$C_CYN" "$n" "$C_RST" "$line"
+            fi
+        done <<< "$all_ips"
+        local choice
+        choice=$(prompt_value "Номер IP" "1")
+        pick_host=$(printf '%s\n' "$all_ips" | sed -n "${choice}p")
+        [[ -z "$pick_host" ]] && pick_host=$(printf '%s\n' "$all_ips" | sed -n '1p')
+        printf '\n'
+    fi
+
     local secret
     secret=$(prompt_value "Секрет (32 hex, пусто — сгенерирую)" "")
     if [[ -z "$secret" ]]; then
@@ -2091,11 +2322,14 @@ _users_add() {
             || fail_inline "telemt не запустился — проверь пункт 5"
     fi
 
+    [[ -n "$pick_host" ]] && set_user_link_host "$name" "$pick_host"
+
     local DOMAIN="" TLS_DOMAIN=""
     [[ -f .env ]] && source .env 2>/dev/null || true
-    local host="${DOMAIN:-$(detect_public_ip)}"
+    local host; host=$(user_link_host "$name")
     local hex_mask
     hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
+    printf '\n%sIP выдачи: %s%s\n' "$C_DIM" "$host" "$C_RST"
     printf '\n%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
         "$C_GRN$C_BLD" "$C_RST" "$host" "$PROXY_PORT" "$secret" "$hex_mask"
     printf '%sРезервная (dd):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=dd%s\n' \
@@ -2193,7 +2427,7 @@ print(s[2:34] if s[:2] in ('ee','dd') else s[:32])
 
     local DOMAIN="" TLS_DOMAIN=""
     [[ -f .env ]] && source .env 2>/dev/null || true
-    local host="${DOMAIN:-$(detect_public_ip)}"
+    local host; host=$(user_link_host "$name")
     local hex_mask
     hex_mask=$(printf '%s' "${TLS_DOMAIN:-$TLS_MASK_DOMAIN}" | xxd -ps | tr -d '\n')
     printf '%sОсновная (FakeTLS):%s\nhttps://t.me/proxy?server=%s&port=%s&secret=ee%s%s\n\n' \
@@ -2214,6 +2448,7 @@ _users_delete() {
     local result
     result=$(curl -s -X DELETE "http://127.0.0.1:${PROXY_API_PORT}/v1/users/${name}" 2>/dev/null || true)
     if printf '%s' "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+        forget_user_link_host "$name"
         ok_inline "Удалён"
     else
         # M1: НЕ откатываемся на enabled:false — выключенный (но не удалённый) юзер
