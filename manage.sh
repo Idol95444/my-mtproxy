@@ -29,8 +29,12 @@ TELEMT_BIN="/bin/telemt"
 TELEMT_CONF="/etc/telemt/telemt.toml"
 TELEMT_SVC="telemt"
 
-TLS_DOMAIN_CANDIDATES=("www.cloudflare.com" "www.apple.com" "www.microsoft.com" "www.bing.com")
-TLS_MASK_DOMAIN="www.cloudflare.com"
+# Маска для fake-TLS. Не берём CDN с публикуемыми списками диапазонов (Cloudflare,
+# AWS, Akamai, Fastly): связка «SNI крупного CDN + датацентровый адрес не из его
+# сетей» проверяется одним запросом. Кандидаты — обычный хостинг в NL, TLS 1.3 + h2,
+# 200 с реальной страницей, проверены на доступность из Москвы и СПб 06.09.2026.
+TLS_DOMAIN_CANDIDATES=("www.antagonist.nl" "www.versio.nl" "www.one.com")
+TLS_MASK_DOMAIN="www.antagonist.nl"
 
 AUDIT_LOG="/var/log/telemt-audit.jsonl"
 
