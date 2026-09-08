@@ -1,0 +1,19 @@
+# Сюда telemt отдаёт (1) self-fetch TLS-профилей для всех tls_domains и
+# (2) неаутентифицированные соединения с известным SNI (mask = true).
+# По SNI: свой домен -> локальный vhost с настоящим сертификатом (8444),
+# старые чужие маски -> passthrough на настоящие сайты, остальное -> reject (8445).
+# Хостнеймы passthrough резолвятся через resolver в рантайме.
+map $ssl_preread_server_name $telemt_front {
+    __TLS_DOMAIN__      127.0.0.1:8444;
+    www.antagonist.nl   www.antagonist.nl:443;
+    www.cloudflare.com  www.cloudflare.com:443;
+    default             127.0.0.1:8445;
+}
+server {
+    listen 127.0.0.1:8443;
+    resolver 127.0.0.53 valid=300s;
+    ssl_preread on;
+    proxy_pass $telemt_front;
+    proxy_connect_timeout 5s;
+    proxy_timeout 60s;
+}

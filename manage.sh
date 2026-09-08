@@ -34,7 +34,9 @@ TELEMT_SVC="telemt"
 # сетей» проверяется одним запросом. Кандидаты — обычный хостинг в NL, TLS 1.3 + h2,
 # 200 с реальной страницей, проверены на доступность из Москвы и СПб 06.09.2026.
 TLS_DOMAIN_CANDIDATES=("www.antagonist.nl" "www.versio.nl" "www.one.com")
-TLS_MASK_DOMAIN="www.antagonist.nl"
+# С 09.09.2026 маска — собственный домен (см. nginx/ и telemt.toml.template); кандидаты
+# выше остаются для fallback-режима с чужим сайтом.
+TLS_MASK_DOMAIN="tg1.limbossh.date"
 
 AUDIT_LOG="/var/log/telemt-audit.jsonl"
 

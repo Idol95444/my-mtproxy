@@ -1,0 +1,19 @@
+# Бэкенды stream-фронта telemt (telemt-front.conf). Только loopback.
+server {
+    listen 127.0.0.1:8445 ssl default_server;
+    ssl_reject_handshake on;
+}
+server {
+    listen 127.0.0.1:8444 ssl;
+    server_name __TLS_DOMAIN__;
+
+    ssl_certificate     /etc/letsencrypt/live/__TLS_DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__TLS_DOMAIN__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log off;
+    error_log /dev/null;
+
+    root /var/www/html;
+    index index.html index.nginx-debian.html;
+}
