@@ -83,7 +83,9 @@ def detect_hosts():
         except Exception:
             pass
         found = sorted(set(found))
-        _hosts_cache.update(list=found, ts=now)
+        # В кэш — копию: ниже список мутируется (remove), иначе основной IP навсегда
+        # пропадал из кэша и после смены основного старый адрес «исчезал» на 60 с.
+        _hosts_cache.update(list=list(found), ts=now)
     primary = primary_host()
     if primary in found:
         found.remove(primary)
@@ -126,6 +128,136 @@ def forget_user_host(name):
     m = load_host_map()
     if m.pop(name, None) is not None:
         save_host_map(m)
+
+# ── Состояние IP: основной, выведенные из раздачи, переселение ───────────────
+#
+# Сценарий смены IP после бана: хостер вешает новый адрес на VM (бот увидит его сам,
+# detect_hosts читает интерфейс) → владелец в боте выводит забаненный IP из раздачи и/или
+# делает новый основным → переселяет на него пользователей → переносит A-запись
+# домена-маски на новый IP. Ссылки «с доменом» после переноса A-записи оживают сами,
+# ссылки «по IP» надо раздать заново.
+
+HOSTS_STATE = "/opt/telemt/hosts-state.json"
+
+def load_hosts_state():
+    try:
+        with open(HOSTS_STATE) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+def save_hosts_state(st):
+    try:
+        os.makedirs(os.path.dirname(HOSTS_STATE), exist_ok=True)
+        tmp = HOSTS_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, HOSTS_STATE)
+        return True
+    except Exception:
+        return False
+
+def retired_hosts():
+    return [h for h in load_hosts_state().get("retired", []) if isinstance(h, str)]
+
+def set_host_retired(host, retired):
+    st  = load_hosts_state()
+    cur = set(retired_hosts())
+    (cur.add if retired else cur.discard)(host)
+    st["retired"] = sorted(cur)
+    return save_hosts_state(st)
+
+def active_hosts():
+    """IP, на которые выдаём новые ссылки: все с интерфейса минус выведенные из раздачи."""
+    off = set(retired_hosts())
+    return [h for h in detect_hosts() if h not in off]
+
+def set_env_value(key, value):
+    """Правит одну строку KEY=... в .env (атомарно, права файла сохраняются)."""
+    try:
+        with open(ENV_FILE) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    out, done = [], False
+    for line in lines:
+        if line.split("=", 1)[0].strip() == key and not line.lstrip().startswith("#"):
+            out.append(f"{key}={value}"); done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f"{key}={value}")
+    tmp = ENV_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    try:
+        os.chmod(tmp, os.stat(ENV_FILE).st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(tmp, ENV_FILE)
+
+def set_primary_host(host):
+    """Новый основной IP. Пользователи без явной привязки переезжают вместе с ним;
+    привязанные к старому основному — остаются на нём (иначе они бы молча сменили IP)."""
+    old = primary_host()
+    if host == old:
+        return
+    m = load_host_map()
+    d = api_get("/v1/users")
+    for u in (d.get("data", []) if d.get("ok") else []):
+        name = u["username"]
+        if name not in m:
+            m[name] = old
+    m = {n: h for n, h in m.items() if h != host}   # привязка к новому основному не хранится
+    save_host_map(m)
+    set_env_value("PRIMARY_HOST", host)
+    set_host_retired(host, False)
+
+def move_users(src, dst):
+    """Переселяет всех пользователей с IP src на dst. Возвращает список имён."""
+    d = api_get("/v1/users")
+    moved = []
+    for u in (d.get("data", []) if d.get("ok") else []):
+        if user_host(u["username"]) == src:
+            set_user_host(u["username"], dst)
+            moved.append(u["username"])
+    return moved
+
+_dns_cache = {}
+
+def resolve_host(name, ttl=60):
+    """IPv4-адреса домена (кэш 60с). Пустой set — не резолвится."""
+    now = time.time()
+    hit = _dns_cache.get(name)
+    if hit and now - hit[1] < ttl:
+        return hit[0]
+    ips = set()
+    try:
+        import socket
+        for info in socket.getaddrinfo(name, 443, socket.AF_INET, socket.SOCK_STREAM):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    _dns_cache[name] = (ips, now)
+    return ips
+
+def domain_status(c=None):
+    """Куда смотрит домен-маска. (domain, ips, verdict, ok) или (None, ...) если домена нет."""
+    c = c or load_env()
+    domain = c.get("TLS_DOMAIN", "").strip()
+    if not domain:
+        return None, set(), "", False
+    ips  = resolve_host(domain)
+    ours = set(detect_hosts())
+    off  = set(retired_hosts())
+    if not ips:
+        return domain, ips, "❌ не резолвится", False
+    if ips & (ours - off):
+        return domain, ips, "✅ наш IP", True
+    if ips & off:
+        return domain, ips, "⚠️ IP выведен из раздачи — перенеси A-запись", False
+    return domain, ips, "❌ не наш IP — перенеси A-запись", False
 
 def make_links(secret, host, c=None):
     c        = c or load_env()
@@ -304,11 +436,26 @@ def kb_monitor():
         [("◀️ Главная",  "main")],
     )
 
-def kb_host_pick(name, action, back="users"):
+def kb_host_pick(name, action, back="users", exclude=None):
     primary = primary_host()
     rows = [[(("⭐ " if h == primary else "") + h, f"{action}:{name}:{h}")]
-            for h in detect_hosts()]
+            for h in active_hosts() if h != exclude]
     rows.append([("◀️ Отмена", back)])
+    return kb(*rows)
+
+def kb_ips(hosts, primary, retired):
+    rows = []
+    for h in hosts:
+        row = []
+        if h != primary:
+            row.append((f"⭐ {h}", f"host_primary:{h}"))
+        if h in retired:
+            row.append((f"↩ вернуть {h}", f"host_restore:{h}"))
+        elif h != primary:
+            row.append((f"⛔ вывести {h}", f"host_retire:{h}"))
+        row.append((f"🔀 с {h}", f"move:{h}"))
+        rows.append(row)
+    rows.append([("🔄 Обновить", "ips"), ("◀️ Главная", "main")])
     return kb(*rows)
 
 def kb_confirm_del(name):
@@ -452,6 +599,7 @@ def build_ips():
     for u in users:
         by_host.setdefault(user_host(u["username"]), []).append(u["username"])
 
+    retired = set(retired_hosts())
     ru    = check_ru_reachability(hosts)
     parts = ["🌐 <b>IP-адреса сервера</b>"]
     for h in hosts:
@@ -466,16 +614,24 @@ def build_ips():
             status = f"⛔️ из РФ НЕ отвечает ({', '.join(bad)}) — похоже на бан ТСПУ"
         else:
             status = f"⚠️ частично: ок {', '.join(ok)}, таймаут {', '.join(bad)}"
-        who = by_host.get(h, [])
-        block = (f"<b>{h}</b>{' ⭐ основной' if h == primary else ''}\n"
+        who  = by_host.get(h, [])
+        tags = (" ⭐ основной" if h == primary else "") + (" ⛔ выведен из раздачи" if h in retired else "")
+        block = (f"<b>{h}</b>{tags}\n"
                  f"  {status}\n"
                  f"  Пользователей: {len(who)}")
         if who:
             block += "\n  " + ", ".join(who[:10]) + ("…" if len(who) > 10 else "")
         parts.append(block)
-    parts.append("<i>Проверка через check-host.net: ru2 — Москва, ru3 — СПб.\n"
-                 "Результат кэшируется на 5 минут.</i>")
-    return "\n\n".join(parts), kb([("🔄 Обновить", "ips")], [("◀️ Главная", "main")])
+
+    domain, dips, verdict, _ = domain_status()
+    if domain:
+        parts.append(f"🌍 Домен <b>{domain}</b> → {', '.join(sorted(dips)) or '—'}  {verdict}")
+
+    parts.append("<i>⭐ — сделать основным, ⛔ — не выдавать новых ссылок на этот IP, "
+                 "🔀 — переселить всех его пользователей на другой IP.\n"
+                 "Новый IP достаточно повесить на VM — бот увидит его сам.\n"
+                 "Проверка через check-host.net: ru2 — Москва, ru3 — СПб; кэш 5 минут.</i>")
+    return "\n\n".join(parts), kb_ips(hosts, primary, retired)
 
 def build_user_links(name):
     c = load_env()
@@ -496,13 +652,27 @@ def build_user_links(name):
     host   = user_host(name)
     ee, dd = make_links(secret, host, c)
     mark   = " ⭐ основной" if host == primary_host() else ""
-    return (
+    if host in retired_hosts():
+        mark += " ⛔ выведен из раздачи — переведи пользователя на другой IP"
+    text = (
         f"🔗 <b>Ссылки {name}</b>\n"
         f"IP: <b>{host}</b>{mark}\n\n"
-        f"<b>FakeTLS (основная):</b>\n<code>{ee}</code>\n\n"
-        f"<b>dd (резерв):</b>\n<code>{dd}</code>"
-    ), kb([("🌐 Сменить IP", f"hostpick:{name}")],
-          [("◀️ Назад",      f"user_detail:{name}")])
+        f"<b>По IP — FakeTLS:</b>\n<code>{ee}</code>\n\n"
+        f"<b>По IP — dd (резерв):</b>\n<code>{dd}</code>"
+    )
+    domain, dips, verdict, ok = domain_status(c)
+    if domain:
+        dee, ddd = make_links(secret, domain, c)
+        text += (f"\n\n🌍 <b>С доменом</b> ({domain} → {', '.join(sorted(dips)) or '—'} {verdict}):\n"
+                 f"<code>{dee}</code>\n\n"
+                 f"<b>С доменом — dd:</b>\n<code>{ddd}</code>\n\n"
+                 f"<i>Ссылка с доменом переживает смену IP: достаточно перенести A-запись. "
+                 f"Но опубликованный домен РКН резолвит сам и банит новый IP за сутки (02.09) — "
+                 f"для приватных пользователей давай ссылку по IP.</i>")
+        if not ok:
+            text += "\n⚠️ Сейчас ссылка с доменом ведёт не на рабочий IP."
+    return text, kb([("🌐 Сменить IP", f"hostpick:{name}")],
+                    [("◀️ Назад",      f"user_detail:{name}")])
 
 def build_monitor():
     lines = ["🖥 <b>Мониторинг сервера</b>\n"]
@@ -718,6 +888,60 @@ def on_callback(cb_id, chat_id, msg_id, data):
         text, markup = build_user_links(name)
         edit(chat_id, msg_id, text, markup)
 
+    elif data.startswith("host_primary:"):
+        host = data.split(":", 1)[1]
+        if host not in detect_hosts():
+            edit(chat_id, msg_id, f"❌ IP {host} на сервере не найден", kb([("◀️ IP-адреса", "ips")])); return
+        edit(chat_id, msg_id,
+             f"⭐ Сделать <b>{host}</b> основным?\n\n"
+             f"Пользователи без явной привязки (сейчас на {primary_host()}) останутся на своём IP — "
+             f"их ссылки не изменятся. Новые пользователи по умолчанию пойдут на {host}.",
+             kb([("⭐ Да", f"host_primary_ok:{host}"), ("↩ Отмена", "ips")]))
+
+    elif data.startswith("host_primary_ok:"):
+        host = data.split(":", 1)[1]
+        if host in detect_hosts():
+            set_primary_host(host)
+        text, markup = build_ips()
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("host_retire:"):
+        host = data.split(":", 1)[1]
+        if host == primary_host():
+            edit(chat_id, msg_id, "❌ Основной IP вывести нельзя — сначала назначь другой основным",
+                 kb([("◀️ IP-адреса", "ips")])); return
+        set_host_retired(host, True)
+        text, markup = build_ips()
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("host_restore:"):
+        set_host_retired(data.split(":", 1)[1], False)
+        text, markup = build_ips()
+        edit(chat_id, msg_id, text, markup)
+
+    elif data.startswith("move:"):
+        src = data.split(":", 1)[1]
+        d   = api_get("/v1/users")
+        who = [u["username"] for u in d.get("data", []) if d.get("ok") and user_host(u["username"]) == src]
+        if not who:
+            edit(chat_id, msg_id, f"На <b>{src}</b> нет пользователей — переселять некого.",
+                 kb([("◀️ IP-адреса", "ips")])); return
+        edit(chat_id, msg_id,
+             f"🔀 Переселить <b>{len(who)}</b> пользователей с <b>{src}</b>:\n"
+             f"{', '.join(who[:15])}{'…' if len(who) > 15 else ''}\n\nКуда?",
+             kb_host_pick(src, "move_ok", back="ips", exclude=src))
+
+    elif data.startswith("move_ok:"):
+        _, src, dst = data.split(":", 2)
+        if dst not in active_hosts():
+            edit(chat_id, msg_id, f"❌ IP {dst} недоступен для раздачи", kb([("◀️ IP-адреса", "ips")])); return
+        moved = move_users(src, dst)
+        edit(chat_id, msg_id,
+             f"✅ Переселены на <b>{dst}</b>: {', '.join(moved) or '—'}\n\n"
+             f"Ссылки «по IP» у них теперь другие — раздай заново (👥 → 🔗). "
+             f"Ссылки «с доменом» заработают сами, когда A-запись будет указывать на {dst}.",
+             kb([("👥 Пользователи", "users"), ("🌐 IP-адреса", "ips")]))
+
     elif data == "user_add_hint":
         edit(chat_id, msg_id,
              "➕ Напиши:\n\n<code>/adduser имя</code>\n\n"
@@ -743,8 +967,8 @@ def create_user(name, host):
     if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', name):
         return ("❌ Имя пользователя: только латиница, цифры, `-`, `_`, до 32 символов",
                 kb([("◀️ Пользователи", "users")]))
-    if host not in detect_hosts():
-        return (f"❌ IP {host} на сервере не найден",
+    if host not in active_hosts():
+        return (f"❌ IP {host} на сервере не найден или выведен из раздачи",
                 kb([("◀️ Пользователи", "users")]))
 
     secret = secrets.token_hex(16)
@@ -795,12 +1019,12 @@ def cmd_adduser(chat_id, args):
     if not args:
         send(chat_id, "Использование: /adduser &lt;имя&gt; [IP]"); return
     name  = args[0]
-    hosts = detect_hosts()
+    hosts = active_hosts()
 
     # IP задан прямо в команде
     if len(args) > 1:
         if args[1] not in hosts:
-            send(chat_id, f"❌ IP <b>{args[1]}</b> на сервере не найден.\n"
+            send(chat_id, f"❌ IP <b>{args[1]}</b> на сервере не найден или выведен из раздачи.\n"
                           f"Доступны: {', '.join(hosts) or '—'}"); return
         text, markup = create_user(name, args[1])
         send(chat_id, text, markup); return
@@ -865,7 +1089,7 @@ def cmd_help(chat_id, _):
          "/monitor — мониторинг сервера\n"
          "/adduser &lt;имя&gt; [IP] — добавить пользователя\n"
          "/link &lt;user&gt; — ссылки пользователя\n"
-         "/ips — IP сервера и их доступность из РФ\n"
+         "/ips — IP сервера, доступность из РФ, смена основного, переселение\n"
          "/quota &lt;user&gt; &lt;ГБ&gt; — квота (0 = снять)\n"
          "/block &lt;IP&gt; — заблокировать IP",
          kb_main())
